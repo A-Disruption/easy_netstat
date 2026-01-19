@@ -1,0 +1,5 @@
+module = "icon"
+
+[glyphs]
+refresh = "entypo-arrows-ccw"
+settings = "entypo-cog"
