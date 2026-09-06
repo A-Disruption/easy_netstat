@@ -21,6 +21,53 @@ mod icon;
 /// How often an automatic refresh runs, before the user changes it.
 const DEFAULT_REFRESH_SECS: u64 = 5;
 
+/// The application icon: one source for the taskbar, the window and the title
+/// bar. Nine resolutions, 16x16 up to 256x256.
+const ICON: &[u8] = include_bytes!("../assets/netstat-rust.ico");
+
+/// The width the title-bar icon is drawn at, in logical pixels. Matches
+/// `NativeFrameConfig::window_icon_size`, whose container clips rather than
+/// scales -- so the element has to arrive already the right size.
+const TITLE_BAR_ICON_SIZE: f32 = 16.0;
+
+/// Decodes [`ICON`] for the window, and so for the taskbar and Alt-Tab.
+///
+/// iced only builds an `Icon` out of raw RGBA, so the `.ico` is decoded here
+/// rather than handed over as a file. The `image` crate's ICO decoder yields
+/// the largest entry, 256x256, which leaves Windows the most to work with
+/// wherever it needs a smaller one.
+fn window_icon() -> Option<iced::window::Icon> {
+    let icon = image::load_from_memory_with_format(ICON, image::ImageFormat::Ico)
+        .ok()?
+        .into_rgba8();
+
+    let (width, height) = icon.dimensions();
+
+    iced::window::icon::from_rgba(icon.into_raw(), width, height).ok()
+}
+
+/// Decodes [`ICON`] for the title bar.
+///
+/// Resampled on the CPU rather than left to the GPU at draw time: the source is
+/// 256 square and the title bar draws it at 16, and a sampler asked for a 16x
+/// reduction in one step aliases badly. 32 is the physical size at 200% display
+/// scaling, so there is headroom on a HiDPI screen without carrying a texture
+/// nothing needs.
+fn title_bar_icon() -> Option<iced::widget::image::Handle> {
+    const SIZE: u32 = 32;
+
+    let icon = image::load_from_memory_with_format(ICON, image::ImageFormat::Ico)
+        .ok()?
+        .resize_exact(SIZE, SIZE, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+
+    Some(iced::widget::image::Handle::from_rgba(
+        SIZE,
+        SIZE,
+        icon.into_raw(),
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Settings,
@@ -60,6 +107,9 @@ struct App {
     /// behind it. Cloned from the one `main` built the window settings with,
     /// so both sides agree on the frame's geometry.
     frame: NativeFrame,
+    /// Decoded once at startup. `view` runs every frame and an ICO decode plus
+    /// a Lanczos resample is not something to repeat at that rate.
+    icon: Option<iced::widget::image::Handle>,
 }
 
 enum DataState<T, E> {
@@ -145,6 +195,7 @@ impl App {
                 refresh_secs_input: DEFAULT_REFRESH_SECS.to_string(),
                 theme: Theme::Nord,
                 frame,
+                icon: title_bar_icon(),
             },
             Task::done(Message::RefreshData)
         )
@@ -162,6 +213,7 @@ impl App {
         iced::window::Settings {
             size: iced::Size::new(1275.0, 768.0),
             min_size: Some( iced::Size::new(1275.0, 768.0) ),
+            icon: window_icon(),
             ..iced::window::Settings::default()
         }
     }
@@ -366,19 +418,6 @@ impl App {
         let page = container(
             column![
                 row![
-                    space::horizontal(),
-                    text("Net Stat")
-                        .size(26),
-                    space::horizontal(),
-                    button(icon::settings())
-                        .style(button::text)
-                        .on_press(Message::Settings)
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center)
-                .width(Length::Fill)
-                .padding(10.0),
-                row![
                     text("Filter : "),
                     popover(
                         text_input("Filter text i.e. port:5013", &self.filter_text_staged)
@@ -431,9 +470,43 @@ impl App {
         // with spacing would still budget a gap for it.
         let content = stack![page, self.settings()];
 
-        // The frame draws its own title bar from the same palette the rest of
-        // the app uses, so it follows the theme picker with nothing else wired.
-        self.frame.decorate("Easy Net Stat", content, Message::Frame)
+        // Until `install_latest` resolves there is no window to decorate. In
+        // practice that is the first frame only.
+        let Some(window_id) = self.frame.primary_window() else {
+            return content.into();
+        };
+
+        // The title bar's application-owned row. The leading space captures
+        // nothing, so it falls through to the draggable region behind it and
+        // the gear ends up beside the caption controls.
+        let title_content = row![
+            space::horizontal(),
+            button(icon::settings())
+                .style(button::text)
+                .padding([0.0, 10.0])
+                .on_press(Message::Settings),
+        ]
+        .align_y(Alignment::Center);
+
+        // The frame draws its title bar from the same palette the rest of the
+        // app uses, so it follows the theme picker with nothing else wired.
+        // The frame's icon slot clips to `window_icon_size` instead of scaling,
+        // so the image is sized here to land inside it.
+        let window_icon: Option<Element<'a, Message>> = self.icon.clone().map(|handle| {
+            iced::widget::image(handle)
+                .width(TITLE_BAR_ICON_SIZE)
+                .height(TITLE_BAR_ICON_SIZE)
+                .into()
+        });
+
+        self.frame.view(
+            window_id,
+            "Easy Net Stat",
+            window_icon,
+            Some(title_content.into()),
+            content,
+            Message::Frame,
+        )
     }
 
     /// The settings surface: a modal window over a dimmed page.
@@ -459,6 +532,7 @@ impl App {
                     text("Theme"),
                     space::horizontal(),
                     pick_list(Some(&self.theme), Theme::ALL, Theme::to_string)
+                        .menu_height(Length::Fixed(300.0))
                         .on_select(Message::ThemeChanged),
                 ]
                 .spacing(8)
@@ -1123,6 +1197,23 @@ mod tests {
         assert_eq!(
             suggestions(&typing(sockets, "proc:server.exe proc:")),
             vec!["proc:agent.exe", "proc:server.exe"],
+        );
+    }
+
+    #[test]
+    fn the_icon_decodes_for_both_the_window_and_the_title_bar() {
+        // Guards the `image` crate's `ico` feature as much as the file itself:
+        // without it the decode returns `Err` and both callers silently fall
+        // back to no icon at all.
+        let icon = window_icon().expect("the .ico decodes for the window");
+        let (pixels, size) = icon.into_raw();
+
+        assert_eq!(size, iced::Size::new(256, 256), "expected the largest entry");
+        assert_eq!(pixels.len(), 256 * 256 * 4, "expected RGBA");
+
+        assert!(
+            title_bar_icon().is_some(),
+            "the .ico decodes for the title bar",
         );
     }
 

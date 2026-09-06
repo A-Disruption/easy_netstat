@@ -19,11 +19,18 @@ advanced-table = { path = "C:/Rust Projects/advanced-table" }
 iced-native-frame = { path = "C:/Rust Projects/iced-window-decorations" }
 netstat2 = { version = "0.11.2" }
 sysinfo = { version = "0.37.2" }
+# Decodes the multi-resolution .ico into the raw RGBA that iced's window Icon`n# and image Handle both want. Same 0.25 that iced already pulls in.
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 
 [build-dependencies]
 # iced_fontello 0.14 still generates `Font::with_name`, which iced master renamed
 # to `with_family`. Its master branch (0.15.0-dev) tracks the rename.
 iced_fontello = { git = "https://github.com/hecrj/iced_fontello.git", branch = "master" }
+
+# Embeds the .ico into the exe's Win32 resources, which is where Windows looks
+# for the taskbar, Alt-Tab and Explorer icons.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 # `widgets` asks for `iced 0.15.0-dev`, which is unreleased, so cargo cannot
 # resolve it from crates.io on its own. `[patch]` is only honoured in the
