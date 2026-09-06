@@ -9,6 +9,7 @@ use iced::event;
 use iced::time::Instant;
 
 use advanced_table::{data_table, leaf, Direction, Policy, Sort};
+use iced_native_frame::{FrameAction, NativeFrame, NativeFrameConfig};
 use widgets::anchor::{Align, Side};
 use widgets::layer::modal;
 use widgets::popover::{self, popover};
@@ -34,6 +35,7 @@ pub enum Message {
     AutoRefreshToggled(bool),
     RefreshIntervalChanged(String),
     ThemeChanged(Theme),
+    Frame(FrameAction),
 }
 struct App {
     process_info: DataState<Vec<SocketDisplay>, Error>,
@@ -54,6 +56,10 @@ struct App {
     /// middle of the edit.
     refresh_secs_input: String,
     theme: Theme,
+    /// Draws the title bar and owns the caption state (maximized, focused)
+    /// behind it. Cloned from the one `main` built the window settings with,
+    /// so both sides agree on the frame's geometry.
+    frame: NativeFrame,
 }
 
 enum DataState<T, E> {
@@ -117,7 +123,7 @@ impl SocketDisplay {
 }
 
 impl App {
-    pub fn new() -> (Self, Task<Message>) {
+    pub fn new(frame: NativeFrame) -> (Self, Task<Message>) {
         let sys = System::new_with_specifics(
             RefreshKind::everything(),
         );        
@@ -138,6 +144,7 @@ impl App {
                 refresh_secs: DEFAULT_REFRESH_SECS,
                 refresh_secs_input: DEFAULT_REFRESH_SECS.to_string(),
                 theme: Theme::Nord,
+                frame,
             },
             Task::done(Message::RefreshData)
         )
@@ -186,6 +193,11 @@ impl App {
             }
             Message::ThemeChanged(theme) => {
                 self.theme = theme;
+            }
+            Message::Frame(action) => {
+                // Dragging, resizing, snapping and the caption buttons all come
+                // back through here as window `Task`s.
+                return self.frame.update(action, Message::Frame);
             }
             Message::SortChanged(sort) => {
                 // The table renders the sort and reports what it should become;
@@ -417,7 +429,11 @@ impl App {
 
         // A `Stack`, not a `Column`: the layer reports a zero size, and a column
         // with spacing would still budget a gap for it.
-        stack![page, self.settings()].into()
+        let content = stack![page, self.settings()];
+
+        // The frame draws its own title bar from the same palette the rest of
+        // the app uses, so it follows the theme picker with nothing else wired.
+        self.frame.decorate("Easy Net Stat", content, Message::Frame)
     }
 
     /// The settings surface: a modal window over a dimmed page.
@@ -492,7 +508,10 @@ impl App {
             }
         );
 
-        Subscription::batch(vec![tick, auto_refresh, keyboard])
+        // The frame needs the window events to track maximization and focus.
+        let frame = self.frame.subscription().map(Message::Frame);
+
+        Subscription::batch(vec![tick, auto_refresh, keyboard, frame])
     }
 
     fn generate_autocomplete(&self) -> Vec<AutocompleteOption> {
@@ -597,13 +616,34 @@ impl App {
 }
 
 pub fn main() -> iced::Result {
-    iced::application(App::new, App::update, App::view)
-        .theme(App::theme)
-        .title(App::title)
-        .subscription(App::subscription)
-        .window(App::window_settings())
-        .font(icon::FONT)
-        .run()
+    let frame = NativeFrame::new(NativeFrameConfig::platform_default());
+
+    // The frame has requirements of its own for the window -- undecorated, and
+    // whatever the platform needs for rounded corners and the drop shadow -- so
+    // it gets to amend the settings before they are handed to iced.
+    let settings = frame.window_settings(App::window_settings());
+
+    iced::application(
+        {
+            let frame = frame.clone();
+
+            move || {
+                let (app, task) = App::new(frame.clone());
+
+                // `install_latest` subclasses the window iced just opened, which
+                // is what gives the title bar its Windows 11 caption semantics.
+                (app, Task::batch([task, frame.install_latest().discard()]))
+            }
+        },
+        App::update,
+        App::view,
+    )
+    .theme(App::theme)
+    .title(App::title)
+    .subscription(App::subscription)
+    .window(settings)
+    .font(icon::FONT)
+    .run()
 }
 
 /// A popover surface with no chrome of its own.
@@ -1027,7 +1067,7 @@ mod tests {
 
     /// An app holding `sockets`, with `typed` sitting in the filter box.
     fn typing(sockets: Vec<SocketDisplay>, typed: &str) -> App {
-        let mut app = App::new().0;
+        let mut app = App::new(NativeFrame::default()).0;
 
         app.process_info = DataState::Loaded(Ok(sockets));
         app.filter_text_staged = String::from(typed);
