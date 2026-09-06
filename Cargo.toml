@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced = { version = "0.14.0", features = [
+iced = { version = "0.15.0-dev", features = [
     "tokio",
-    "lazy",
     "advanced",
     "debug",
     "canvas",
@@ -15,9 +14,20 @@ iced = { version = "0.14.0", features = [
     "markdown",
     "qr_code",
 ] }
-widgets = { path = "C:/Rust Projects/widgets", features = ["collapsible", "tree", "color_picker", "generic_overlay"]}
+widgets = { path = "C:/Rust Projects/widgets", features = ["collapsible", "tree", "color_picker_two", "popover"]}
+advanced-table = { path = "C:/Rust Projects/advanced-table" }
 netstat2 = { version = "0.11.2" }
 sysinfo = { version = "0.37.2" }
 
 [build-dependencies]
-iced_fontello = "0.13"
+# iced_fontello 0.14 still generates `Font::with_name`, which iced master renamed
+# to `with_family`. Its master branch (0.15.0-dev) tracks the rename.
+iced_fontello = { git = "https://github.com/hecrj/iced_fontello.git", branch = "master" }
+
+# `widgets` asks for `iced 0.15.0-dev`, which is unreleased, so cargo cannot
+# resolve it from crates.io on its own. `[patch]` is only honoured in the
+# manifest of the crate actually being built, so this block has to live here
+# even though `widgets` carries its own copy. Both crates then share one
+# `iced`, which is what keeps `Element` and `Theme` a single type across them.
+[patch.crates-io]
+iced = { git = "https://github.com/iced-rs/iced.git", branch = "master" }

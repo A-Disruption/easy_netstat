@@ -1,13 +1,15 @@
 use iced::{
-    Length, Alignment, Element, Subscription, Theme, Task, Font, font, padding, time,
-    widget::{button, column, container, row, scrollable, space, table, text, text_input},
+    Length, Alignment, Element, Subscription, Theme, Task, Font, font, alignment, time,
+    widget::{button, column, container, row, space, text, text_input},
 };
 use iced::widget;
 use iced::keyboard;
 use iced::event;
-use iced::time::{Duration, Instant};
+use iced::time::Instant;
 
-use widgets::generic_overlay::{self, *};
+use advanced_table::{data_table, leaf, Direction, Policy, Sort};
+use widgets::anchor::{Align, Side};
+use widgets::popover::{self, popover};
 use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, error::Error};
 use sysinfo::{ProcessesToUpdate, RefreshKind, System};
 
@@ -22,6 +24,7 @@ pub enum Message {
     CheckDebounce,
     SelectAutocomplete(String),
     AutocompleteNavigate(AutocompleteNav),
+    SortChanged(Option<Sort>),
 }
 struct App {
     process_info: DataState<Vec<SocketDisplay>, Error>,
@@ -33,6 +36,7 @@ struct App {
     autocomplete_suggestions: Vec<AutocompleteOption>,
     autocomplete_selected_index: Option<usize>,
     text_input_id: widget::Id,
+    sort: Option<Sort>,
 }
 
 enum DataState<T, E> {
@@ -111,6 +115,7 @@ impl App {
                 autocomplete_suggestions: Vec::new(),
                 autocomplete_selected_index: None,
                 text_input_id: widget::Id::unique(),
+                sort: None,
             },
             Task::done(Message::RefreshData)
         )
@@ -136,6 +141,11 @@ impl App {
         match message {
             Message::Settings => {
                 // toggle Settings
+            }
+            Message::SortChanged(sort) => {
+                // The table renders the sort and reports what it should become;
+                // reordering the rows is ours to do, in `view`.
+                self.sort = sort;
             }
             Message::FilterChangedImmediate(value) => {
                 self.filter_text = self.filter_text_staged.clone();
@@ -197,7 +207,14 @@ impl App {
                 }
 
                 self.last_keystroke = Some(Instant::now());
-                return iced::widget::operation::focus(self.text_input_id.clone())
+
+                // Focus alone leaves the caret where it was, which lands it in
+                // the middle of the text just inserted. Park it at the end so
+                // typing continues from the completion.
+                return Task::batch([
+                    iced::widget::operation::focus(self.text_input_id.clone()),
+                    iced::widget::operation::move_cursor_to_end(self.text_input_id.clone()),
+                ]);
             }
             Message::AutocompleteNavigate(nav) => {
                 match nav {
@@ -235,43 +252,54 @@ impl App {
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
         let process: Element<Message> = match &self.process_info {
             DataState::Loaded(Ok(sockets)) => {
-                let filtered: Vec<_> = sockets.iter()
-                    .filter(|socket| {
-                        if self.filter_text.is_empty() {
-                            return true;
-                        }
+                // Parsed once for the whole sweep. It used to be rebuilt inside
+                // the closure, so every socket re-tokenized the filter string.
+                let filter = (!self.filter_text.is_empty())
+                    .then(|| optimize_filter(parse_filter(&self.filter_text)));
 
-                        let expr = parse_filter(&self.filter_text);
-                        let optimized = optimize_filter(expr);
-                        optimized.matches(socket)
-                    })
+                let mut rows: Vec<&SocketDisplay> = sockets
+                    .iter()
+                    .filter(|socket| filter.as_ref().is_none_or(|expr| expr.matches(socket)))
                     .collect();
-                
-                    let bold = |header| {
-                        text(header).font(Font {
-                            weight: font::Weight::Bold,
-                            ..Font::DEFAULT
-                        })
-                    };
 
-                    let columns = [
-                        table::column(bold("Protocol"), |socket: &SocketDisplay| text(&socket.protocol)),
-                        table::column(bold("State"), |socket: &SocketDisplay| text(&socket.state)),
-                        table::column(bold("Local Address"), |socket: &SocketDisplay| text(&socket.local_addr)),
-                        table::column(bold("Remote Address"), |socket: &SocketDisplay| text(&socket.remote_addr)),
-                        table::column(bold("PID"), |socket: &SocketDisplay| text(&socket.pid))
-                            .align_x(Alignment::End)
-                            .align_y(Alignment::Center),
-                        table::column(bold("Process"), |socket: &SocketDisplay| text(&socket.process_name)),
-                    ];
+                if let Some(sort) = self.sort {
+                    sort_rows(&mut rows, sort);
+                }
 
-                    scrollable(
-                        container(
-                            table(columns, filtered)
-                                .padding_x(10.0)
-                                .padding_y(5.0)
-                        ).padding(padding::right(15.0))
-                    ).into()
+                let bold = |header| {
+                    text(header).font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    })
+                };
+
+                data_table(vec![
+                    leaf(bold("Protocol")).fixed(90.0).sortable(),
+                    leaf(bold("State")).fixed(130.0).sortable(),
+                    leaf(bold("Local Address")).fill(2).sortable(),
+                    leaf(bold("Remote Address")).fill(2).sortable(),
+                    leaf(bold("PID"))
+                        .fixed(80.0)
+                        .align(alignment::Horizontal::Right)
+                        .sortable(),
+                    leaf(bold("Process")).fill(2).sortable(),
+                ])
+                .rows(rows, |socket, column| match column {
+                    0 => text(&socket.protocol).into(),
+                    1 => text(&socket.state).into(),
+                    2 => text(&socket.local_addr).into(),
+                    3 => text(&socket.remote_addr).into(),
+                    4 => text(&socket.pid).into(),
+                    _ => text(&socket.process_name).into(),
+                })
+                .sorting(self.sort, Message::SortChanged)
+                .vertical_scroll(Policy::Auto)
+                .horizontal_scroll(Policy::Auto)
+                .padding([5.0, 10.0])
+                .spacing(1.0)
+                .resizable(true)
+                .height(Length::Fill)
+                .into()
             }
             DataState::Loading => text("Loading...").into(),
             DataState::NotLoaded => button("Load Network Info").into(),
@@ -295,7 +323,7 @@ impl App {
                 .padding(10.0),
                 row![
                     text("Filter : "),
-                    overlay_button(
+                    popover(
                         text_input("Filter text i.e. port:5013", &self.filter_text_staged)
                             .on_input(Message::FilterChanged)
                             .on_submit(Message::FilterChangedImmediate(self.filter_text_staged.clone()))
@@ -303,7 +331,6 @@ impl App {
                             .id(self.text_input_id.clone())
                             .size(16)
                             .padding(5.0),
-                        "",
                         column(
                             self.autocomplete_suggestions.iter().enumerate().map(|(idx, suggestion)| {
                                 let is_selected = self.autocomplete_selected_index == Some(idx);
@@ -321,17 +348,13 @@ impl App {
                         )
                         .spacing(2)
                     )
-                    .is_open(!self.autocomplete_suggestions.is_empty())
-                    .on_hover()
-                    .hover_position(Position::Bottom)
-                    .hover_alignment(Alignment::Start)
-                    .style(button::text)
-                    .hover_gap(0.0)
-                    .overlay_style(generic_overlay::blank)
+                    .open(!self.autocomplete_suggestions.is_empty())
+                    .side(Side::Bottom)
+                    .align(Align::Start)
+                    .gap(0.0)
                     .padding(0.0)
-                    .overlay_padding(0.0)
-                    .hide_header()
-                    .interactive_base(true),
+                    .min_width(260.0)
+                    .style(blank_popover),
 
                     button(icon::refresh())
                         .on_press(Message::RefreshData)
@@ -340,14 +363,10 @@ impl App {
                 .spacing(10)
                 .align_y(Alignment::Center)
                 .padding(10.0),
-                container(
-                    column![
-//                        auto_complete,
-                        process
-                    ]
-                )
+                container(process).height(Length::Fill)
             ]
             .width(Length::Fill)
+            .height(Length::Fill)
             .padding(10.0)
         ).into()
     }
@@ -402,13 +421,21 @@ impl App {
                 let (field, partial) = last_token.split_once(':').unwrap();
                 let partial_lower = partial.to_lowercase();
                 
-                let mut values = std::collections::HashSet::new();
+                // Ordered, not hashed: the highlighted row is tracked by index,
+                // so a set that reshuffles each keystroke moves the selection
+                // out from under the arrow keys.
+                let mut values = std::collections::BTreeSet::new();
                 
                 for socket in sockets {
+                    // Every field the filter parser understands, under the same
+                    // names and aliases `parse_single_criterion` accepts.
                     let value = match field.to_lowercase().as_str() {
                         "protocol" | "proto" => &socket.protocol,
                         "process" | "proc" => &socket.process_name,
                         "state" => &socket.state,
+                        "local" | "localaddr" => &socket.local_addr,
+                        "remote" | "remoteaddr" => &socket.remote_addr,
+                        "pid" => &socket.pid,
                         _ => continue,
                     };
                     
@@ -454,6 +481,51 @@ pub fn main() -> iced::Result {
         .window(App::window_settings())
         .font(icon::FONT)
         .run()
+}
+
+/// A popover surface with no chrome of its own.
+///
+/// The suggestion buttons draw the whole dropdown, so the surface behind them
+/// stays out of the way - the same thing `generic_overlay::blank` used to do.
+fn blank_popover(theme: &Theme) -> popover::Style {
+    popover::Style {
+        background: iced::Background::Color(iced::Color::TRANSPARENT),
+        border: iced::Border::default(),
+        shadow: iced::Shadow::default(),
+        text_color: theme.palette().background.base.text,
+    }
+}
+
+/// Order the visible rows by the column the table reports as sorted.
+///
+/// The table draws the sort indicator and hands back what the sort should
+/// become, but never reorders anything itself -- it only ever sees the
+/// `Element` built from each field, not the value behind it.
+fn sort_rows(rows: &mut [&SocketDisplay], sort: Sort) {
+    rows.sort_by(|a, b| {
+        let ordering = match sort.column {
+            0 => a.protocol.cmp(&b.protocol),
+            1 => a.state.cmp(&b.state),
+            2 => a.local_addr.cmp(&b.local_addr),
+            3 => a.remote_addr.cmp(&b.remote_addr),
+            // Numerically, so 9 comes before 10. Sockets with no owning process
+            // carry "-" rather than a number, and sort to the end ascending.
+            4 => a
+                .pid
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+                .cmp(&b.pid.parse::<u32>().unwrap_or(u32::MAX)),
+            _ => a
+                .process_name
+                .to_lowercase()
+                .cmp(&b.process_name.to_lowercase()),
+        };
+
+        match sort.direction {
+            Direction::Ascending => ordering,
+            Direction::Descending => ordering.reverse(),
+        }
+    });
 }
 
 fn get_netstat(system: &mut System) -> Result<Vec<SocketInfo>, Error> {
