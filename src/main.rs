@@ -1,6 +1,7 @@
 use iced::{
     Length, Alignment, Element, Subscription, Theme, Task, Font, font, alignment, time,
-    widget::{button, column, container, row, space, text, text_input},
+    widget::{button, column, container, pick_list, row, space, stack, text, text_input,
+             toggler},
 };
 use iced::widget;
 use iced::keyboard;
@@ -9,11 +10,15 @@ use iced::time::Instant;
 
 use advanced_table::{data_table, leaf, Direction, Policy, Sort};
 use widgets::anchor::{Align, Side};
+use widgets::layer::modal;
 use widgets::popover::{self, popover};
 use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, error::Error};
 use sysinfo::{ProcessesToUpdate, RefreshKind, System};
 
 mod icon;
+
+/// How often an automatic refresh runs, before the user changes it.
+const DEFAULT_REFRESH_SECS: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -25,6 +30,10 @@ pub enum Message {
     SelectAutocomplete(String),
     AutocompleteNavigate(AutocompleteNav),
     SortChanged(Option<Sort>),
+    SettingsDismissed,
+    AutoRefreshToggled(bool),
+    RefreshIntervalChanged(String),
+    ThemeChanged(Theme),
 }
 struct App {
     process_info: DataState<Vec<SocketDisplay>, Error>,
@@ -37,6 +46,14 @@ struct App {
     autocomplete_selected_index: Option<usize>,
     text_input_id: widget::Id,
     sort: Option<Sort>,
+    show_settings: bool,
+    auto_refresh: bool,
+    refresh_secs: u64,
+    /// Kept as text, not just as the parsed `refresh_secs`, so the field can be
+    /// emptied and retyped without the interval snapping to something in the
+    /// middle of the edit.
+    refresh_secs_input: String,
+    theme: Theme,
 }
 
 enum DataState<T, E> {
@@ -116,6 +133,11 @@ impl App {
                 autocomplete_selected_index: None,
                 text_input_id: widget::Id::unique(),
                 sort: None,
+                show_settings: false,
+                auto_refresh: false,
+                refresh_secs: DEFAULT_REFRESH_SECS,
+                refresh_secs_input: DEFAULT_REFRESH_SECS.to_string(),
+                theme: Theme::Nord,
             },
             Task::done(Message::RefreshData)
         )
@@ -126,7 +148,7 @@ impl App {
     }
 
     fn theme(&self) -> Theme {
-        Theme::Nord
+        self.theme.clone()
     }
 
     pub fn window_settings() -> iced::window::Settings {
@@ -140,7 +162,30 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Settings => {
-                // toggle Settings
+                self.show_settings = !self.show_settings;
+            }
+            Message::SettingsDismissed => {
+                self.show_settings = false;
+            }
+            Message::AutoRefreshToggled(enabled) => {
+                self.auto_refresh = enabled;
+            }
+            Message::RefreshIntervalChanged(value) => {
+                // Digits only. The interval itself only moves when the field
+                // holds something usable, so clearing it leaves the last good
+                // value running rather than dropping to zero.
+                let digits: String = value.chars().filter(char::is_ascii_digit).collect();
+
+                if let Ok(secs) = digits.parse::<u64>()
+                    && secs > 0
+                {
+                    self.refresh_secs = secs;
+                }
+
+                self.refresh_secs_input = digits;
+            }
+            Message::ThemeChanged(theme) => {
+                self.theme = theme;
             }
             Message::SortChanged(sort) => {
                 // The table renders the sort and reports what it should become;
@@ -306,7 +351,7 @@ impl App {
             DataState::Loaded(Err(e)) => text(format!("Error: {}", e)).into(),
         };
 
-        container(
+        let page = container(
             column![
                 row![
                     space::horizontal(),
@@ -368,13 +413,61 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(10.0)
-        ).into()
+        );
+
+        // A `Stack`, not a `Column`: the layer reports a zero size, and a column
+        // with spacing would still budget a gap for it.
+        stack![page, self.settings()].into()
+    }
+
+    /// The settings surface: a modal window over a dimmed page.
+    fn settings(&self) -> Element<'_, Message> {
+        let interval = row![
+            text("Every"),
+            text_input("5", &self.refresh_secs_input)
+                .on_input(Message::RefreshIntervalChanged)
+                .width(Length::Fixed(70.0))
+                .padding(5.0),
+            text("seconds"),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        modal(
+            column![
+                toggler(self.auto_refresh)
+                    .label("Refresh automatically")
+                    .on_toggle(Message::AutoRefreshToggled),
+                interval,
+                row![
+                    text("Theme"),
+                    space::horizontal(),
+                    pick_list(Some(&self.theme), Theme::ALL, Theme::to_string)
+                        .on_select(Message::ThemeChanged),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(16),
+            "Settings",
+        )
+        .open(self.show_settings)
+        .min_width(340.0)
+        .on_dismiss(Message::SettingsDismissed)
+        .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
         use iced::keyboard::{key, Key};
 
         let tick = time::every(std::time::Duration::from_millis(100)).map(|_| Message::CheckDebounce);
+
+        let auto_refresh = if self.auto_refresh {
+            time::every(std::time::Duration::from_secs(self.refresh_secs.max(1)))
+                .map(|_| Message::RefreshData)
+        } else {
+            Subscription::none()
+        };
 
         let keyboard = event::listen_with(|event, _, _| 
             match event {
@@ -399,7 +492,7 @@ impl App {
             }
         );
 
-        Subscription::batch(vec![tick, keyboard])
+        Subscription::batch(vec![tick, auto_refresh, keyboard])
     }
 
     fn generate_autocomplete(&self) -> Vec<AutocompleteOption> {
@@ -420,13 +513,43 @@ impl App {
             if last_token.contains(':') {
                 let (field, partial) = last_token.split_once(':').unwrap();
                 let partial_lower = partial.to_lowercase();
+
+                // Everything already typed except the token being completed, so
+                // the values offered are the ones actually reachable: with
+                // `local:5013 proc:` in the box, only the processes on that port.
+                //
+                // Criteria on the same field are dropped, because
+                // `optimize_filter` OR-s those together -- narrowing by
+                // `proc:chrome` would hide every process that could be added
+                // next to it.
+                let field_name = parse_single_criterion(last_token).field_name();
+
+                let context = {
+                    let mut tokens: Vec<&str> =
+                        self.filter_text_staged.split_whitespace().collect();
+                    tokens.pop();
+
+                    let rest = tokens
+                        .into_iter()
+                        .filter(|token| {
+                            parse_single_criterion(token).field_name() != field_name
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    (!rest.is_empty()).then(|| optimize_filter(parse_filter(&rest)))
+                };
+
+                let in_context = |socket: &SocketDisplay| {
+                    context.as_ref().is_none_or(|expr| expr.matches(socket))
+                };
                 
                 // Ordered, not hashed: the highlighted row is tracked by index,
                 // so a set that reshuffles each keystroke moves the selection
                 // out from under the arrow keys.
                 let mut values = std::collections::BTreeSet::new();
                 
-                for socket in sockets {
+                for socket in sockets.iter().filter(|socket| in_context(socket)) {
                     // Every field the filter parser understands, under the same
                     // names and aliases `parse_single_criterion` accepts.
                     let value = match field.to_lowercase().as_str() {
@@ -883,5 +1006,98 @@ fn optimize_filter(expr: FilterExpr) -> FilterExpr {
             FilterExpr::Or(exprs.into_iter().map(optimize_filter).collect())
         }
         other => other,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn socket(local: &str, process: &str, pid: &str) -> SocketDisplay {
+        SocketDisplay {
+            protocol: String::from("TCP"),
+            state: String::from("Listen"),
+            local_addr: String::from(local),
+            remote_addr: String::from("*:*"),
+            pid: String::from(pid),
+            process_name: String::from(process),
+        }
+    }
+
+    /// An app holding `sockets`, with `typed` sitting in the filter box.
+    fn typing(sockets: Vec<SocketDisplay>, typed: &str) -> App {
+        let mut app = App::new().0;
+
+        app.process_info = DataState::Loaded(Ok(sockets));
+        app.filter_text_staged = String::from(typed);
+
+        app
+    }
+
+    fn suggestions(app: &App) -> Vec<String> {
+        app.generate_autocomplete()
+            .into_iter()
+            .map(|option| option.insert)
+            .collect()
+    }
+
+    #[test]
+    fn every_field_offers_values_not_just_the_three_that_used_to() {
+        let sockets = vec![socket("0.0.0.0:5013", "server.exe", "42")];
+
+        for (typed, expected) in [
+            ("local:50", "local:0.0.0.0:5013"),
+            ("remote:*", "remote:*:*"),
+            ("pid:4", "pid:42"),
+        ] {
+            assert_eq!(suggestions(&typing(sockets.clone(), typed)), vec![expected]);
+        }
+    }
+
+    #[test]
+    fn suggestions_are_narrowed_by_the_rest_of_the_filter() {
+        let sockets = vec![
+            socket("0.0.0.0:5013", "server.exe", "1"),
+            socket("0.0.0.0:5013", "agent.exe", "2"),
+            socket("0.0.0.0:9999", "unrelated.exe", "3"),
+        ];
+
+        // Only the two processes actually on 5013, rather than every process
+        // the machine happens to be running.
+        assert_eq!(
+            suggestions(&typing(sockets, "local:5013 proc:")),
+            vec!["proc:agent.exe", "proc:server.exe"],
+        );
+    }
+
+    #[test]
+    fn a_second_value_for_one_field_still_sees_its_alternatives() {
+        let sockets = vec![
+            socket("0.0.0.0:5013", "server.exe", "1"),
+            socket("0.0.0.0:9999", "agent.exe", "2"),
+        ];
+
+        // `optimize_filter` OR-s criteria on the same field, so narrowing by
+        // the first `proc:` would leave nothing left to add beside it.
+        assert_eq!(
+            suggestions(&typing(sockets, "proc:server.exe proc:")),
+            vec!["proc:agent.exe", "proc:server.exe"],
+        );
+    }
+
+    #[test]
+    fn completing_a_value_leaves_a_trailing_space_but_a_field_name_does_not() {
+        let mut app = typing(vec![socket("0.0.0.0:5013", "server.exe", "42")], "local:");
+
+        // A bare field name is only half a criterion -- the caret has to stay
+        // put so the value can be typed straight after the colon.
+        let _ = app.update(Message::SelectAutocomplete(String::from("local:")));
+        assert_eq!(app.filter_text_staged, "local:");
+
+        let _ = app.update(Message::SelectAutocomplete(String::from(
+            "local:0.0.0.0:5013",
+        )));
+        assert_eq!(app.filter_text_staged, "local:0.0.0.0:5013 ");
     }
 }
