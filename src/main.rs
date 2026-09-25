@@ -716,7 +716,7 @@ pub fn main() -> iced::Result {
     .title(App::title)
     .subscription(App::subscription)
     .window(settings)
-    .font(icon::FONT)
+    .fonts([icon::FONT])
     .run()
 }
 
