@@ -1,5 +1,5 @@
 use iced::{
-    Length, Alignment, Element, Subscription, Theme, Task, Font, font, alignment, time,
+    Length, Alignment, Element, Subscription, Theme, Task, Font, Widget, font, alignment, time,
     widget::{button, column, container, pick_list, row, space, stack, text, text_input,
              toggler},
 };
@@ -174,9 +174,12 @@ impl SocketDisplay {
 
 impl App {
     pub fn new(frame: NativeFrame) -> (Self, Task<Message>) {
+        // Every row is joined to a process from this, so there is no app
+        // without it.
         let sys = System::new_with_specifics(
             RefreshKind::everything(),
-        );        
+        )
+        .expect("failed to read the system's process list");
         (
             Self {
                 process_info: DataState::NotLoaded,
@@ -322,7 +325,7 @@ impl App {
                 // typing continues from the completion.
                 return Task::batch([
                     iced::widget::operation::focus(self.text_input_id.clone()),
-                    iced::widget::operation::move_cursor_to_end(self.text_input_id.clone()),
+                    iced::widget::operation::text_input::move_cursor_to_end(self.text_input_id.clone()),
                 ]);
             }
             Message::AutocompleteNavigate(nav) => {
@@ -394,12 +397,12 @@ impl App {
                     leaf(bold("Process")).fill(2).sortable(),
                 ])
                 .rows(rows, |socket, column| match column {
-                    0 => text(&socket.protocol).into(),
-                    1 => text(&socket.state).into(),
-                    2 => text(&socket.local_addr).into(),
-                    3 => text(&socket.remote_addr).into(),
-                    4 => text(&socket.pid).into(),
-                    _ => text(&socket.process_name).into(),
+                    0 => text(&socket.protocol).boxed(),
+                    1 => text(&socket.state).boxed(),
+                    2 => text(&socket.local_addr).boxed(),
+                    3 => text(&socket.remote_addr).boxed(),
+                    4 => text(&socket.pid).boxed(),
+                    _ => text(&socket.process_name).boxed(),
                 })
                 .sorting(self.sort, Message::SortChanged)
                 .vertical_scroll(Policy::Auto)
@@ -408,11 +411,11 @@ impl App {
                 .spacing(1.0)
                 .resizable(true)
                 .height(Length::Fill)
-                .into()
+                .boxed()
             }
-            DataState::Loading => text("Loading...").into(),
-            DataState::NotLoaded => button("Load Network Info").into(),
-            DataState::Loaded(Err(e)) => text(format!("Error: {}", e)).into(),
+            DataState::Loading => text("Loading...").boxed(),
+            DataState::NotLoaded => button("Load Network Info").boxed(),
+            DataState::Loaded(Err(e)) => text(format!("Error: {}", e)).boxed(),
         };
 
         let page = container(
@@ -439,7 +442,6 @@ impl App {
                                     } else {
                                         button::secondary
                                     })
-                                    .into()
                             })
                         )
                         .spacing(2)
@@ -473,7 +475,7 @@ impl App {
         // Until `install_latest` resolves there is no window to decorate. In
         // practice that is the first frame only.
         let Some(window_id) = self.frame.primary_window() else {
-            return content.into();
+            return content.boxed();
         };
 
         // The title bar's application-owned row. The leading space captures
@@ -496,14 +498,14 @@ impl App {
             iced::widget::image(handle)
                 .width(TITLE_BAR_ICON_SIZE)
                 .height(TITLE_BAR_ICON_SIZE)
-                .into()
+                .boxed()
         });
 
         self.frame.view(
             window_id,
             "Easy Net Stat",
             window_icon,
-            Some(title_content.into()),
+            Some(title_content.boxed()),
             content,
             Message::Frame,
         )
@@ -544,7 +546,7 @@ impl App {
         .open(self.show_settings)
         .min_width(340.0)
         .on_dismiss(Message::SettingsDismissed)
-        .into()
+        .boxed()
     }
 
     fn subscription(&self) -> Subscription<Message> {

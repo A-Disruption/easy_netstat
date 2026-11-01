@@ -18,7 +18,7 @@ widgets = { path = "C:/Rust Projects/widgets", features = ["collapsible", "tree"
 advanced-table = { path = "C:/Rust Projects/advanced-table" }
 iced-native-frame = { path = "C:/Rust Projects/iced-window-decorations" }
 netstat2 = { version = "0.11.2" }
-sysinfo = { version = "0.37.2" }
+sysinfo = { version = "0.40" }
 # Decodes the multi-resolution .ico into the raw RGBA that iced's window Icon`n# and image Handle both want. Same 0.25 that iced already pulls in.
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 
