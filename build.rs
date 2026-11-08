@@ -1,6 +1,7 @@
 ﻿fn main() {
-    println!("cargo::rerun-if-changed=fonts/icons.toml");
-    iced_fontello::build("fonts/icons.toml").expect("Fonts Missing");
+    // Generated font assets are checked in. Ordinary builds must be offline
+    // and must not regenerate tracked source files or contact fontello.com.
+    println!("cargo::rerun-if-changed=fonts/icons.ttf");
 
     // The taskbar, Alt-Tab and File Explorer all read the icon from the
     // executable's resources, not from the window: iced's window::Settings

@@ -1,22 +1,37 @@
-use iced::{
-    Length, Alignment, Element, Subscription, Theme, Task, Font, Widget, font, alignment, time,
-    widget::{button, column, container, pick_list, row, space, stack, text, text_input,
-             toggler},
-};
-use iced::widget;
-use iced::keyboard;
 use iced::event;
+use iced::keyboard;
 use iced::time::Instant;
+use iced::widget;
+use iced::{
+    Alignment, Element, Font, Length, Subscription, Task, Theme, Widget, alignment, font, time,
+    widget::{button, column, container, pick_list, row, space, stack, text, text_input, toggler},
+};
 
-use advanced_table::{data_table, leaf, Direction, Policy, Sort};
+use advanced_table::{Direction, Policy, Sort, data_table, leaf};
+use easy_netstat::{
+    collectors::{Cancellation, DiagnosticCollector},
+    diagnostics::{self, Analysis},
+    inventory::InventoryCollector,
+    model::*,
+    state::{History, JobGate},
+    storage::{self, Preferences, SavedView, Snapshot},
+};
+use filter::{FilterExpr, optimize_filter, parse_filter, parse_single_criterion};
 use iced_native_frame::{FrameAction, NativeFrame, NativeFrameConfig};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use widgets::anchor::{Align, Side};
 use widgets::layer::modal;
 use widgets::popover::{self, popover};
-use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, SocketInfo, error::Error};
-use sysinfo::{ProcessesToUpdate, RefreshKind, System};
 
+mod filter;
 mod icon;
+mod workbench_ui;
 
 /// How often an automatic refresh runs, before the user changes it.
 const DEFAULT_REFRESH_SECS: u64 = 5;
@@ -69,9 +84,34 @@ fn title_bar_icon() -> Option<iced::widget::image::Handle> {
 }
 
 #[derive(Debug, Clone)]
-pub enum Message {
+enum Message {
     Settings,
     RefreshData,
+    InventoryReady(u64, Result<Arc<Inventory>, String>),
+    SelectConnection(Option<ConnectionKey>),
+    ToggleWorkbench,
+    CloseDetails,
+    Diagnose(bool),
+    EvaluateCached,
+    AnalysisReady(u64, ConnectionKey, Result<Arc<Analysis>, String>),
+    CancelDiagnosis,
+    DiagnosisReady(u64, ConnectionKey, Result<Arc<DiagnosticData>, String>),
+    ScenarioChanged(String, String),
+    ToggleSection(String),
+    CaptureSnapshot,
+    CompareSnapshot,
+    SaveSnapshot,
+    LoadSnapshot,
+    SnapshotLoaded(Result<Arc<Snapshot>, String>),
+    ExportReport,
+    IoFinished(Result<String, String>),
+    ViewNameChanged(String),
+    SaveView,
+    LoadView(String),
+    PreferencesLoaded(Result<Preferences, String>),
+    DnsChanged(String),
+    ResolveDns,
+    DnsReady(Result<Vec<String>, String>),
     FilterChanged(String),
     FilterChangedImmediate(String),
     CheckDebounce,
@@ -85,8 +125,40 @@ pub enum Message {
     Frame(FrameAction),
 }
 struct App {
-    process_info: DataState<Vec<SocketDisplay>, Error>,
-    system_info: System,
+    process_info: DataState<Vec<SocketDisplay>, String>,
+    collector: Arc<Mutex<InventoryCollector>>,
+    diagnostic_collector: Arc<Mutex<DiagnosticCollector>>,
+    inventory_gate: JobGate,
+    diagnostic_gate: JobGate,
+    diagnostic_cancel: Option<Cancellation>,
+    history: History,
+    selected: Option<Connection>,
+    diagnostic_data: Option<Arc<DiagnosticData>>,
+    analysis: Analysis,
+    analysis_request: u64,
+    analysis_busy: bool,
+    show_workbench: bool,
+    sections: BTreeSet<String>,
+    local_input: String,
+    peer_input: String,
+    direction: easy_netstat::model::Direction,
+    interface_input: String,
+    expected_service: String,
+    expected_port: String,
+    status: String,
+    filter_error: Option<String>,
+    parsed_filter: Option<FilterExpr>,
+    preferences: Preferences,
+    preferences_ready: bool,
+    view_name: String,
+    loaded_view: Option<String>,
+    snapshot: Option<Snapshot>,
+    session_id: String,
+    file_path: String,
+    dns_name: String,
+    dns_busy: bool,
+    dns_cancel: Option<Cancellation>,
+    dns_result: String,
     filter_text: String,
     filter_text_staged: String,
     last_keystroke: Option<Instant>,
@@ -114,12 +186,12 @@ struct App {
 
 enum DataState<T, E> {
     NotLoaded,
-    Loading,
     Loaded(Result<T, E>),
 }
 
 #[derive(Clone)]
 struct SocketDisplay {
+    key: Option<ConnectionKey>,
     protocol: String,
     state: String,
     local_addr: String,
@@ -129,61 +201,64 @@ struct SocketDisplay {
 }
 
 impl SocketDisplay {
-    fn from_socket(socket: &SocketInfo, sys: &System) -> Self {
-        let protocol = match socket.protocol_socket_info {
-            ProtocolSocketInfo::Tcp(_) => "TCP".to_string(),
-            ProtocolSocketInfo::Udp(_) => "UDP".to_string(),
-        };
-
-        let (local_addr, remote_addr, state) = match &socket.protocol_socket_info {
-            ProtocolSocketInfo::Tcp(tcp_info) => (
-                format!("{}:{}", tcp_info.local_addr, tcp_info.local_port),
-                format!("{}:{}", tcp_info.remote_addr, tcp_info.remote_port),
-                format!("{:?}", tcp_info.state),
-            ),
-            ProtocolSocketInfo::Udp(udp_info) => (
-                format!("{}:{}", udp_info.local_addr, udp_info.local_port),
-                String::from("*:*"),
-                String::from("-"),
-            ),
-        };
-
-        let process_name = socket
-            .associated_pids
-            .first()
-            .and_then(|&pid| sys.process(sysinfo::Pid::from_u32(pid)))
-            .map(|process| process.name().to_string_lossy().to_string())
-            .unwrap_or_else(|| String::from("Unknown"));
-
-        let pid = socket
-            .associated_pids
-            .first()
-            .map(|pid| pid.to_string())
-            .unwrap_or_else(|| String::from("-"));
-
+    fn from_connection(c: &Connection) -> Self {
         Self {
-            protocol,
-            state,
-            local_addr,
-            remote_addr,
-            pid,
-            process_name,
+            key: Some(c.key.clone()),
+            protocol: c.key.protocol.to_string(),
+            state: c.state.clone(),
+            local_addr: c.key.local.to_string(),
+            remote_addr: c
+                .key
+                .remote
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "*:*".into()),
+            pid: c.key.process.pid.to_string(),
+            process_name: c.process.name.clone(),
         }
     }
 }
 
 impl App {
     pub fn new(frame: NativeFrame) -> (Self, Task<Message>) {
-        // Every row is joined to a process from this, so there is no app
-        // without it.
-        let sys = System::new_with_specifics(
-            RefreshKind::everything(),
-        )
-        .expect("failed to read the system's process list");
         (
             Self {
                 process_info: DataState::NotLoaded,
-                system_info: sys,
+                collector: Arc::new(Mutex::new(InventoryCollector::default())),
+                diagnostic_collector: Arc::new(Mutex::new(DiagnosticCollector::default())),
+                inventory_gate: JobGate::default(),
+                diagnostic_gate: JobGate::default(),
+                diagnostic_cancel: None,
+                history: History::default(),
+                selected: None,
+                diagnostic_data: None,
+                analysis: Analysis::default(),
+                analysis_request: 0,
+                analysis_busy: false,
+                show_workbench: false,
+                sections: BTreeSet::new(),
+                local_input: String::new(),
+                peer_input: String::new(),
+                direction: easy_netstat::model::Direction::Inbound,
+                interface_input: String::new(),
+                expected_service: String::new(),
+                expected_port: String::new(),
+                status: String::new(),
+                filter_error: None,
+                parsed_filter: None,
+                preferences: Preferences::default(),
+                preferences_ready: false,
+                view_name: String::new(),
+                loaded_view: None,
+                snapshot: None,
+                session_id: format!("{}:{}", std::process::id(), now_ms()),
+                file_path: storage::default_directory()
+                    .join(format!("diagnostic-{}.md", now_ms()))
+                    .to_string_lossy()
+                    .into_owned(),
+                dns_name: String::new(),
+                dns_busy: false,
+                dns_cancel: None,
+                dns_result: String::new(),
                 filter_text: String::new(),
                 filter_text_staged: String::new(),
                 last_keystroke: None,
@@ -200,7 +275,24 @@ impl App {
                 frame,
                 icon: title_bar_icon(),
             },
-            Task::done(Message::RefreshData)
+            Task::batch([
+                Task::done(Message::RefreshData),
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(|| {
+                            let path = storage::preferences_path();
+                            if !path.exists() {
+                                Ok(Preferences::default())
+                            } else {
+                                storage::load_preferences(&path)
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::PreferencesLoaded,
+                ),
+            ]),
         )
     }
 
@@ -215,7 +307,7 @@ impl App {
     pub fn window_settings() -> iced::window::Settings {
         iced::window::Settings {
             size: iced::Size::new(1275.0, 768.0),
-            min_size: Some( iced::Size::new(1275.0, 768.0) ),
+            min_size: Some(iced::Size::new(1275.0, 768.0)),
             icon: window_icon(),
             ..iced::window::Settings::default()
         }
@@ -225,12 +317,17 @@ impl App {
         match message {
             Message::Settings => {
                 self.show_settings = !self.show_settings;
+                self.autocomplete_suggestions.clear();
+                self.autocomplete_selected_index = None;
             }
             Message::SettingsDismissed => {
                 self.show_settings = false;
             }
             Message::AutoRefreshToggled(enabled) => {
                 self.auto_refresh = enabled;
+                if !enabled {
+                    self.inventory_gate.clear_pending();
+                }
             }
             Message::RefreshIntervalChanged(value) => {
                 // Digits only. The interval itself only moves when the field
@@ -238,9 +335,7 @@ impl App {
                 // value running rather than dropping to zero.
                 let digits: String = value.chars().filter(char::is_ascii_digit).collect();
 
-                if let Ok(secs) = digits.parse::<u64>()
-                    && secs > 0
-                {
+                if let Some(secs) = easy_netstat::state::valid_interval(&digits) {
                     self.refresh_secs = secs;
                 }
 
@@ -260,20 +355,66 @@ impl App {
                 self.sort = sort;
             }
             Message::FilterChangedImmediate(value) => {
-                self.filter_text = self.filter_text_staged.clone();
+                self.filter_text_staged = value;
+                self.apply_filter();
+                self.last_keystroke = None;
             }
             Message::RefreshData => {
-                let socket_info = get_netstat(&mut self.system_info);
-                
-                self.process_info = DataState::Loaded(
-                    socket_info.map(|sockets| {
-                        sockets
-                            .iter()
-                            .map(|socket| SocketDisplay::from_socket(socket, &self.system_info))
-                            .collect()
-                    })
-                );
+                return self.start_inventory();
             }
+            Message::InventoryReady(id, result) => {
+                let Some(pending) = self.inventory_gate.finish(id) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(sample) => {
+                        self.history.apply(Arc::unwrap_or_clone(sample));
+                        self.process_info = DataState::Loaded(Ok(self
+                            .history
+                            .current
+                            .iter()
+                            .map(SocketDisplay::from_connection)
+                            .collect()));
+                        if let Some(selected) = &mut self.selected
+                            && selected.key.process.created.is_some()
+                            && let Some(current) =
+                                self.history.current.iter().find(|c| c.key == selected.key)
+                        {
+                            *selected = current.clone();
+                        }
+                    }
+                    Err(error) => {
+                        self.history.errors = vec![error];
+                    }
+                }
+                if pending {
+                    return self.start_inventory();
+                }
+            }
+            other @ (Message::SelectConnection(_)
+            | Message::ToggleWorkbench
+            | Message::CloseDetails
+            | Message::Diagnose(_)
+            | Message::EvaluateCached
+            | Message::AnalysisReady(..)
+            | Message::CancelDiagnosis
+            | Message::DiagnosisReady(..)
+            | Message::ScenarioChanged(..)
+            | Message::ToggleSection(_)
+            | Message::CaptureSnapshot
+            | Message::CompareSnapshot
+            | Message::SaveSnapshot
+            | Message::LoadSnapshot
+            | Message::SnapshotLoaded(_)
+            | Message::ExportReport
+            | Message::IoFinished(_)
+            | Message::ViewNameChanged(_)
+            | Message::SaveView
+            | Message::LoadView(_)
+            | Message::PreferencesLoaded(_)
+            | Message::DnsChanged(_)
+            | Message::ResolveDns
+            | Message::DnsReady(_)) => return self.update_workbench(other),
             Message::FilterChanged(value) => {
                 self.filter_text_staged = value;
                 self.last_keystroke = Some(Instant::now());
@@ -287,33 +428,30 @@ impl App {
                 };
             }
             Message::CheckDebounce => {
-                if let Some(last) = self.last_keystroke {
-                    if last.elapsed() >= self.debounce_duration {
-                        self.filter_text = self.filter_text_staged.clone();
-                    }
+                if let Some(last) = self.last_keystroke
+                    && last.elapsed() >= self.debounce_duration
+                {
+                    self.apply_filter();
+                    self.last_keystroke = None;
                 }
             }
             Message::SelectAutocomplete(value) => {
-                // Replace last token with selected value
-                let mut tokens: Vec<&str> = self.filter_text_staged.split_whitespace().collect();
-                if !tokens.is_empty() {
-                    tokens.pop();
-                }
-                tokens.push(&value);
+                let start = filter::last_token_start(&self.filter_text_staged);
 
                 // Only add trailing space if the value doesn't end with ':'
-                let trailing_space = if value.ends_with(':') {
-                    ""
-                } else {
-                    " "
-                };
+                let trailing_space = if value.ends_with(':') { "" } else { " " };
 
-                self.filter_text_staged = tokens.join(" ") + trailing_space;
+                self.filter_text_staged = format!(
+                    "{}{}{}",
+                    &self.filter_text_staged[..start],
+                    value,
+                    trailing_space
+                );
 
                 // Clear autocomplete
                 self.autocomplete_suggestions.clear();
                 self.autocomplete_selected_index = None;
-                
+
                 if value.ends_with(':') {
                     self.autocomplete_suggestions = self.generate_autocomplete();
                 }
@@ -325,38 +463,39 @@ impl App {
                 // typing continues from the completion.
                 return Task::batch([
                     iced::widget::operation::focus(self.text_input_id.clone()),
-                    iced::widget::operation::text_input::move_cursor_to_end(self.text_input_id.clone()),
+                    iced::widget::operation::text_input::move_cursor_to_end(
+                        self.text_input_id.clone(),
+                    ),
                 ]);
             }
-            Message::AutocompleteNavigate(nav) => {
-                match nav {
-                    AutocompleteNav::Down => {
-                        if let Some(current) = self.autocomplete_selected_index {
-                            self.autocomplete_selected_index = Some(
-                                (current + 1).min(self.autocomplete_suggestions.len().saturating_sub(1))
-                            );
-                        } else if !self.autocomplete_suggestions.is_empty() {
-                            self.autocomplete_selected_index = Some(0);
-                        }
-                    }
-                    AutocompleteNav::Up => {
-                        if let Some(current) = self.autocomplete_selected_index {
-                            self.autocomplete_selected_index = Some(current.saturating_sub(1));
-                        }
-                    }
-                    AutocompleteNav::Select => {
-                        if let Some(index) = self.autocomplete_selected_index {
-                            if let Some(option) = self.autocomplete_suggestions.get(index) {
-                                return self.update(Message::SelectAutocomplete(option.insert.clone()));
-                            }
-                        }
-                    }
-                    AutocompleteNav::Escape => {
-                        self.autocomplete_suggestions.clear();
-                        self.autocomplete_selected_index = None;
+            Message::AutocompleteNavigate(nav) => match nav {
+                AutocompleteNav::Down => {
+                    if let Some(current) = self.autocomplete_selected_index {
+                        self.autocomplete_selected_index = Some(
+                            (current + 1)
+                                .min(self.autocomplete_suggestions.len().saturating_sub(1)),
+                        );
+                    } else if !self.autocomplete_suggestions.is_empty() {
+                        self.autocomplete_selected_index = Some(0);
                     }
                 }
-            }
+                AutocompleteNav::Up => {
+                    if let Some(current) = self.autocomplete_selected_index {
+                        self.autocomplete_selected_index = Some(current.saturating_sub(1));
+                    }
+                }
+                AutocompleteNav::Select => {
+                    if let Some(index) = self.autocomplete_selected_index
+                        && let Some(option) = self.autocomplete_suggestions.get(index)
+                    {
+                        return self.update(Message::SelectAutocomplete(option.insert.clone()));
+                    }
+                }
+                AutocompleteNav::Escape => {
+                    self.autocomplete_suggestions.clear();
+                    self.autocomplete_selected_index = None;
+                }
+            },
         }
         Task::none()
     }
@@ -366,8 +505,7 @@ impl App {
             DataState::Loaded(Ok(sockets)) => {
                 // Parsed once for the whole sweep. It used to be rebuilt inside
                 // the closure, so every socket re-tokenized the filter string.
-                let filter = (!self.filter_text.is_empty())
-                    .then(|| optimize_filter(parse_filter(&self.filter_text)));
+                let filter = &self.parsed_filter;
 
                 let mut rows: Vec<&SocketDisplay> = sockets
                     .iter()
@@ -378,6 +516,17 @@ impl App {
                     sort_rows(&mut rows, sort);
                 }
 
+                let keys: Vec<_> = rows.iter().map(|r| r.key.clone()).collect();
+                let selected_rows: BTreeSet<usize> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| {
+                        self.selected
+                            .as_ref()
+                            .is_some_and(|c| r.key.as_ref() == Some(&c.key))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
                 let bold = |header| {
                     text(header).font(Font {
                         weight: font::Weight::Bold,
@@ -404,17 +553,30 @@ impl App {
                     4 => text(&socket.pid).boxed(),
                     _ => text(&socket.process_name).boxed(),
                 })
+                .selection(
+                    advanced_table::SelectionMode::Single,
+                    &selected_rows,
+                    move |set| {
+                        Message::SelectConnection(
+                            set.iter()
+                                .next()
+                                .and_then(|i| keys.get(*i))
+                                .cloned()
+                                .flatten(),
+                        )
+                    },
+                )
                 .sorting(self.sort, Message::SortChanged)
                 .vertical_scroll(Policy::Auto)
                 .horizontal_scroll(Policy::Auto)
                 .padding([5.0, 10.0])
-                .spacing(1.0)
+                .spacing(1.0_f32)
                 .resizable(true)
                 .height(Length::Fill)
                 .boxed()
             }
-            DataState::Loading => text("Loading...").boxed(),
-            DataState::NotLoaded => button("Load Network Info").boxed(),
+
+            DataState::NotLoaded => text("Loading network information…").boxed(),
             DataState::Loaded(Err(e)) => text(format!("Error: {}", e)).boxed(),
         };
 
@@ -425,25 +587,28 @@ impl App {
                     popover(
                         text_input("Filter text i.e. port:5013", &self.filter_text_staged)
                             .on_input(Message::FilterChanged)
-                            .on_submit(Message::FilterChangedImmediate(self.filter_text_staged.clone()))
-                            .on_paste(Message::FilterChangedImmediate)
+                            .on_submit(Message::FilterChangedImmediate(
+                                self.filter_text_staged.clone()
+                            ))
                             .id(self.text_input_id.clone())
                             .size(16)
                             .padding(5.0),
-                        column(
-                            self.autocomplete_suggestions.iter().enumerate().map(|(idx, suggestion)| {
+                        column(self.autocomplete_suggestions.iter().enumerate().map(
+                            |(idx, suggestion)| {
                                 let is_selected = self.autocomplete_selected_index == Some(idx);
-                                
+
                                 button(text(&suggestion.display))
-                                    .on_press(Message::SelectAutocomplete(suggestion.insert.clone()))
+                                    .on_press(Message::SelectAutocomplete(
+                                        suggestion.insert.clone(),
+                                    ))
                                     .width(Length::Fill)
                                     .style(if is_selected {
                                         button::primary
                                     } else {
                                         button::secondary
                                     })
-                            })
-                        )
+                            }
+                        ))
                         .spacing(2)
                     )
                     .open(!self.autocomplete_suggestions.is_empty())
@@ -453,7 +618,6 @@ impl App {
                     .padding(0.0)
                     .min_width(260.0)
                     .style(blank_popover),
-
                     button(icon::refresh())
                         .on_press(Message::RefreshData)
                         .style(button::text)
@@ -461,11 +625,20 @@ impl App {
                 .spacing(10)
                 .align_y(Alignment::Center)
                 .padding(10.0),
-                container(process).height(Length::Fill)
+                self.toolbar(),
+                text(self.inventory_status()).size(12),
+                text(&self.status).size(12),
+                text(self.filter_error.as_deref().unwrap_or("")).size(12),
+                row![
+                    container(process).width(Length::Fill).height(Length::Fill),
+                    self.workbench_pane()
+                ]
+                .spacing(8)
+                .height(Length::Fill)
             ]
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(10.0)
+            .padding(10.0),
         );
 
         // A `Stack`, not a `Column`: the layer reports a zero size, and a column
@@ -519,7 +692,15 @@ impl App {
                 .on_input(Message::RefreshIntervalChanged)
                 .width(Length::Fixed(70.0))
                 .padding(5.0),
-            text("seconds"),
+            text("seconds (1–3600)"),
+            text(
+                if easy_netstat::state::valid_interval(&self.refresh_secs_input).is_some() {
+                    ""
+                } else {
+                    "Invalid interval; previous value remains active"
+                }
+            )
+            .size(12),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
@@ -550,9 +731,13 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        use iced::keyboard::{key, Key};
+        use iced::keyboard::{Key, key};
 
-        let tick = time::every(std::time::Duration::from_millis(100)).map(|_| Message::CheckDebounce);
+        let tick = if self.last_keystroke.is_some() {
+            time::every(std::time::Duration::from_millis(50)).map(|_| Message::CheckDebounce)
+        } else {
+            Subscription::none()
+        };
 
         let auto_refresh = if self.auto_refresh {
             time::every(std::time::Duration::from_secs(self.refresh_secs.max(1)))
@@ -561,28 +746,28 @@ impl App {
             Subscription::none()
         };
 
-        let keyboard = event::listen_with(|event, _, _| 
-            match event {
-                event::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
-                    match key {
-                        Key::Named(key::Named::ArrowDown) => {
-                            Some(Message::AutocompleteNavigate(AutocompleteNav::Down))
-                        }
-                        Key::Named(key::Named::ArrowUp) => {
-                            Some(Message::AutocompleteNavigate(AutocompleteNav::Up))
-                        }
-                        Key::Named(key::Named::Enter) | Key::Named(key::Named::Tab) => {
-                            Some(Message::AutocompleteNavigate(AutocompleteNav::Select))
-                        }
-                        Key::Named(key::Named::Escape) => {
-                            Some(Message::AutocompleteNavigate(AutocompleteNav::Escape))
-                        }
-                        _ => None,
-                    }                    
-                }
-                _ => { None }
-            }
-        );
+        let keyboard = if self.autocomplete_suggestions.is_empty() {
+            Subscription::none()
+        } else {
+            event::listen_with(|event, _, _| match event {
+                event::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => match key {
+                    Key::Named(key::Named::ArrowDown) => {
+                        Some(Message::AutocompleteNavigate(AutocompleteNav::Down))
+                    }
+                    Key::Named(key::Named::ArrowUp) => {
+                        Some(Message::AutocompleteNavigate(AutocompleteNav::Up))
+                    }
+                    Key::Named(key::Named::Enter) | Key::Named(key::Named::Tab) => {
+                        Some(Message::AutocompleteNavigate(AutocompleteNav::Select))
+                    }
+                    Key::Named(key::Named::Escape) => {
+                        Some(Message::AutocompleteNavigate(AutocompleteNav::Escape))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+        };
 
         // The frame needs the window events to track maximization and focus.
         let frame = self.frame.subscription().map(Message::Frame);
@@ -596,18 +781,16 @@ impl App {
         }
 
         let mut suggestions = Vec::new();
-        
+
         // Get unique values from current data
         if let DataState::Loaded(Ok(sockets)) = &self.process_info {
-            let last_token = self.filter_text_staged
-                .split_whitespace()
-                .last()
-                .unwrap_or("");
+            let token_start = filter::last_token_start(&self.filter_text_staged);
+            let last_token = &self.filter_text_staged[token_start..];
 
             // Check if typing a field name
             if last_token.contains(':') {
                 let (field, partial) = last_token.split_once(':').unwrap();
-                let partial_lower = partial.to_lowercase();
+                let partial_lower = partial.trim_matches('"').to_lowercase();
 
                 // Everything already typed except the token being completed, so
                 // the values offered are the ones actually reachable: with
@@ -619,32 +802,32 @@ impl App {
                 // next to it.
                 let field_name = parse_single_criterion(last_token).field_name();
 
-                let context = {
-                    let mut tokens: Vec<&str> =
-                        self.filter_text_staged.split_whitespace().collect();
-                    tokens.pop();
-
-                    let rest = tokens
-                        .into_iter()
-                        .filter(|token| {
-                            parse_single_criterion(token).field_name() != field_name
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-
-                    (!rest.is_empty()).then(|| optimize_filter(parse_filter(&rest)))
-                };
+                let context = filter::completion_context(
+                    &self.filter_text_staged[..token_start],
+                    &field_name,
+                );
 
                 let in_context = |socket: &SocketDisplay| {
                     context.as_ref().is_none_or(|expr| expr.matches(socket))
                 };
-                
+
                 // Ordered, not hashed: the highlighted row is tracked by index,
                 // so a set that reshuffles each keystroke moves the selection
                 // out from under the arrow keys.
                 let mut values = std::collections::BTreeSet::new();
-                
+
                 for socket in sockets.iter().filter(|socket| in_context(socket)) {
+                    if field.eq_ignore_ascii_case("port") {
+                        for endpoint in [&socket.local_addr, &socket.remote_addr] {
+                            if let Ok(address) = endpoint.parse::<std::net::SocketAddr>() {
+                                let value = address.port().to_string();
+                                if value.contains(&partial_lower) {
+                                    values.insert(value);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Every field the filter parser understands, under the same
                     // names and aliases `parse_single_criterion` accepts.
                     let value = match field.to_lowercase().as_str() {
@@ -656,25 +839,30 @@ impl App {
                         "pid" => &socket.pid,
                         _ => continue,
                     };
-                    
+
                     if value.to_lowercase().contains(&partial_lower) {
                         values.insert(value.clone());
                     }
                 }
-                
+
                 for value in values {
                     suggestions.push(AutocompleteOption {
                         display: format!("{}:{}", field, value),
-                        insert: format!("{}:{}", field, value),
+                        insert: format!("{}:{}", field, filter::quote_value(&value)),
                     });
                 }
             } else {
                 // Suggest field names
                 let field_names = vec![
-                    "protocol:", "process:", "state:", 
-                    "local:", "remote:", "pid:"
+                    "protocol:",
+                    "process:",
+                    "state:",
+                    "local:",
+                    "remote:",
+                    "pid:",
+                    "port:",
                 ];
-                
+
                 for field in field_names {
                     if field.starts_with(&last_token.to_lowercase()) {
                         suggestions.push(AutocompleteOption {
@@ -685,7 +873,7 @@ impl App {
                 }
             }
         }
-        
+
         suggestions.truncate(10); // Limit to 10 suggestions
         suggestions
     }
@@ -745,8 +933,16 @@ fn sort_rows(rows: &mut [&SocketDisplay], sort: Sort) {
         let ordering = match sort.column {
             0 => a.protocol.cmp(&b.protocol),
             1 => a.state.cmp(&b.state),
-            2 => a.local_addr.cmp(&b.local_addr),
-            3 => a.remote_addr.cmp(&b.remote_addr),
+            2 => a
+                .local_addr
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .cmp(&b.local_addr.parse::<std::net::SocketAddr>().ok()),
+            3 => a
+                .remote_addr
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .cmp(&b.remote_addr.parse::<std::net::SocketAddr>().ok()),
             // Numerically, so 9 comes before 10. Sockets with no owning process
             // carry "-" rather than a number, and sort to the end ascending.
             4 => a
@@ -767,15 +963,6 @@ fn sort_rows(rows: &mut [&SocketDisplay], sort: Sort) {
     });
 }
 
-fn get_netstat(system: &mut System) -> Result<Vec<SocketInfo>, Error> {
-    system.refresh_processes(ProcessesToUpdate::All, true);
-
-    // Get all TCP and UDP sockets for IPv4 and IPv6
-    let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
-    let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
-    get_sockets_info(af_flags, proto_flags)
-}
-
 #[derive(Debug, Clone)]
 struct AutocompleteOption {
     display: String,
@@ -790,348 +977,133 @@ enum AutocompleteNav {
     Escape,
 }
 
-#[derive(Debug, Clone)]
-enum Token {
-    OpenParen,
-    CloseParen,
-    Or,
-    Not,
-    Criterion(FilterCriterion),
-}
-
-#[derive(Debug, Clone)]
-enum FilterExpr {
-    And(Vec<FilterExpr>),
-    Or(Vec<FilterExpr>),
-    Not(Box<FilterExpr>),
-    Criterion(FilterCriterion),
-}
-
-impl FilterExpr {
-    fn matches(&self, socket: &SocketDisplay) -> bool {
-        match self {
-            FilterExpr::And(exprs) => exprs.iter().all(|e| e.matches(socket)),
-            FilterExpr::Or(exprs) => exprs.iter().any(|e| e.matches(socket)),
-            FilterExpr::Not(expr) => !expr.matches(socket),
-            FilterExpr::Criterion(criterion) => criterion.matches(socket),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum FilterCriterion {
-    Protocol(FilterMatch),
-    Process(FilterMatch),
-    State(FilterMatch),
-    LocalAddr(FilterMatch),
-    RemoteAddr(FilterMatch),
-    Pid(FilterMatch),
-    Any(FilterMatch),
-}
-
-impl FilterCriterion {
-    fn field_name(&self) -> String {
-        match self {
-            FilterCriterion::Protocol(_) => "protocol".to_string(),
-            FilterCriterion::Process(_) => "process".to_string(),
-            FilterCriterion::State(_) => "state".to_string(),
-            FilterCriterion::LocalAddr(_) => "local".to_string(),
-            FilterCriterion::RemoteAddr(_) => "remote".to_string(),
-            FilterCriterion::Pid(_) => "pid".to_string(),
-            FilterCriterion::Any(_) => "any".to_string(),
-        }
-    }
-
-    fn matches(&self, socket: &SocketDisplay) -> bool {
-        match self {
-            FilterCriterion::Protocol(m) => m.matches(&socket.protocol),
-            FilterCriterion::Process(m) => m.matches(&socket.process_name),
-            FilterCriterion::State(m) => m.matches(&socket.state),
-            FilterCriterion::LocalAddr(m) => m.matches(&socket.local_addr),
-            FilterCriterion::RemoteAddr(m) => m.matches(&socket.remote_addr),
-            FilterCriterion::Pid(m) => m.matches(&socket.pid),
-            FilterCriterion::Any(m) => {
-                m.matches(&socket.protocol)
-                    || m.matches(&socket.process_name)
-                    || m.matches(&socket.state)
-                    || m.matches(&socket.local_addr)
-                    || m.matches(&socket.remote_addr)
-                    || m.matches(&socket.pid)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum FilterMatch {
-    Exact(String),      // "System" - exact match
-    Contains(String),   // *System* - contains
-    StartsWith(String), // System* - starts with
-    EndsWith(String),   // *System - ends with
-}
-
-impl FilterMatch {
-    fn matches(&self, value: &str) -> bool {
-        let value_lower = value.to_lowercase();
-        match self {
-            FilterMatch::Exact(s) => value_lower == s.to_lowercase(),
-            FilterMatch::Contains(s) => value_lower.contains(&s.to_lowercase()),
-            FilterMatch::StartsWith(s) => value_lower.starts_with(&s.to_lowercase()),
-            FilterMatch::EndsWith(s) => value_lower.ends_with(&s.to_lowercase()),
-        }
-    }
-    
-    fn from_pattern(pattern: &str) -> Self {
-        // Check if pattern is quoted
-        let is_quoted = pattern.starts_with('"') && pattern.ends_with('"');
-        
-        let clean_pattern = if is_quoted {
-            // Remove quotes for exact match
-            pattern.trim_matches('"').to_string()
-        } else {
-            pattern.to_string()
-        };
-        
-        let starts_with_wildcard = clean_pattern.starts_with('*');
-        let ends_with_wildcard = clean_pattern.ends_with('*');
-        
-        // If quoted and no wildcards, treat as exact match
-        if is_quoted && !starts_with_wildcard && !ends_with_wildcard {
-            return FilterMatch::Exact(clean_pattern);
-        }
-        
-        // If not quoted and no explicit wildcards, add them automatically
-        if !is_quoted && !starts_with_wildcard && !ends_with_wildcard {
-            return FilterMatch::Contains(clean_pattern);
-        }
-        
-        // Otherwise handle explicit wildcards
-        match (starts_with_wildcard, ends_with_wildcard) {
-            (true, true) => {
-                FilterMatch::Contains(clean_pattern.trim_matches('*').to_string())
-            }
-            (true, false) => {
-                FilterMatch::EndsWith(clean_pattern.trim_start_matches('*').to_string())
-            }
-            (false, true) => {
-                FilterMatch::StartsWith(clean_pattern.trim_end_matches('*').to_string())
-            }
-            (false, false) => {
-                FilterMatch::Exact(clean_pattern)
-            }
-        }
-    }
-}
-
-fn parse_filter(input: &str) -> FilterExpr {
-    let tokens = tokenize(input);
-    parse_expression(&tokens, 0).0
-}
-
-fn tokenize(input: &str) -> Vec<Token> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                current.push(ch); // Keep the quote in the string
-            }
-            '(' if !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(Token::Criterion(parse_single_criterion(&current)));
-                    current.clear();
-                }
-                tokens.push(Token::OpenParen);
-            }
-            ')' if !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(Token::Criterion(parse_single_criterion(&current)));
-                    current.clear();
-                }
-                tokens.push(Token::CloseParen);
-            }
-            '|' if !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(Token::Criterion(parse_single_criterion(&current)));
-                    current.clear();
-                }
-                tokens.push(Token::Or);
-            }
-            '!' if !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(Token::Criterion(parse_single_criterion(&current)));
-                    current.clear();
-                }
-                tokens.push(Token::Not);
-            }
-            ' ' if !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(Token::Criterion(parse_single_criterion(&current)));
-                    current.clear();
-                }
-            }
-            _ => {
-                current.push(ch);
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(Token::Criterion(parse_single_criterion(&current)));
-    }
-
-    tokens
-}
-
-fn parse_expression(tokens: &[Token], pos: usize) -> (FilterExpr, usize) {
-    if pos >= tokens.len() {
-        return (FilterExpr::And(vec![]), pos);
-    }
-
-    let mut current_pos = pos;
-    let mut or_groups: Vec<Vec<FilterExpr>> = vec![vec![]];
-    let mut current_or_index = 0;
-
-    while current_pos < tokens.len() {
-        match &tokens[current_pos] {
-            Token::Not => {
-                current_pos += 1;
-                if current_pos >= tokens.len() {
-                    break;
-                }
-                
-                // Parse the next expression to negate
-                let (expr, new_pos) = match &tokens[current_pos] {
-                    Token::OpenParen => {
-                        parse_expression(tokens, current_pos + 1)
-                    }
-                    Token::Criterion(criterion) => {
-                        (FilterExpr::Criterion(criterion.clone()), current_pos + 1)
-                    }
-                    _ => break,
-                };
-                
-                or_groups[current_or_index].push(FilterExpr::Not(Box::new(expr)));
-                current_pos = new_pos;
-            }
-            Token::OpenParen => {
-                let (sub_expr, new_pos) = parse_expression(tokens, current_pos + 1);
-                or_groups[current_or_index].push(sub_expr);
-                current_pos = new_pos;
-            }
-            Token::CloseParen => {
-                current_pos += 1;
-                break;
-            }
-            Token::Or => {
-                or_groups.push(vec![]);
-                current_or_index += 1;
-                current_pos += 1;
-            }
-            Token::Criterion(criterion) => {
-                or_groups[current_or_index].push(FilterExpr::Criterion(criterion.clone()));
-                current_pos += 1;
-            }
-        }
-    }
-
-    // Build the expression tree
-    let result = if or_groups.len() > 1 {
-        let or_exprs: Vec<FilterExpr> = or_groups
-            .into_iter()
-            .map(|group| {
-                if group.len() == 1 {
-                    group.into_iter().next().unwrap()
-                } else {
-                    FilterExpr::And(group)
-                }
-            })
-            .collect();
-        FilterExpr::Or(or_exprs)
-    } else {
-        let group = or_groups.into_iter().next().unwrap();
-        if group.len() == 1 {
-            group.into_iter().next().unwrap()
-        } else {
-            FilterExpr::And(group)
-        }
-    };
-
-    (result, current_pos)
-}
-
-fn parse_single_criterion(input: &str) -> FilterCriterion {
-    if let Some((prefix, value)) = input.split_once(':') {
-        let filter_match = FilterMatch::from_pattern(value);
-        match prefix.to_lowercase().as_str() {
-            "protocol" | "proto" => FilterCriterion::Protocol(filter_match),
-            "process" | "proc" => FilterCriterion::Process(filter_match),
-            "state" => FilterCriterion::State(filter_match),
-            "local" | "localaddr" => FilterCriterion::LocalAddr(filter_match),
-            "remote" | "remoteaddr" => FilterCriterion::RemoteAddr(filter_match),
-            "pid" => FilterCriterion::Pid(filter_match),
-            _ => FilterCriterion::Any(FilterMatch::from_pattern(input)),
-        }
-    } else {
-        FilterCriterion::Any(FilterMatch::from_pattern(input))
-    }
-}
-
-fn optimize_filter(expr: FilterExpr) -> FilterExpr {
-    match expr {
-        FilterExpr::And(exprs) => {
-            // Group criteria by field type
-            let mut by_field: std::collections::HashMap<String, Vec<FilterCriterion>> = 
-                std::collections::HashMap::new();
-            let mut other_exprs = Vec::new();
-
-            for e in exprs {
-                match e {
-                    FilterExpr::Criterion(criterion) => {
-                        let field_name = criterion.field_name();
-                        by_field.entry(field_name).or_insert_with(Vec::new).push(criterion);
-                    }
-                    other => other_exprs.push(optimize_filter(other)),
-                }
-            }
-
-            // Convert fields with multiple criteria to OR
-            let mut result = Vec::new();
-            for (_, criteria) in by_field {
-                if criteria.len() > 1 {
-                    result.push(FilterExpr::Or(
-                        criteria.into_iter().map(FilterExpr::Criterion).collect()
-                    ));
-                } else {
-                    result.push(FilterExpr::Criterion(criteria.into_iter().next().unwrap()));
-                }
-            }
-            result.extend(other_exprs);
-
-            if result.len() == 1 {
-                result.into_iter().next().unwrap()
-            } else {
-                FilterExpr::And(result)
-            }
-        }
-        FilterExpr::Or(exprs) => {
-            FilterExpr::Or(exprs.into_iter().map(optimize_filter).collect())
-        }
-        other => other,
-    }
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn immediate_filter_paste_updates_staged_and_applied_text() {
+        let mut app = App::new(NativeFrame::default()).0;
+        let _ = app.update(Message::FilterChangedImmediate("port:5001".into()));
+        assert_eq!(app.filter_text_staged, "port:5001");
+        assert_eq!(app.filter_text, "port:5001");
+        assert!(app.last_keystroke.is_none());
+        let _ = app.update(Message::FilterChangedImmediate("(".into()));
+        assert_eq!(app.filter_text, "port:5001");
+        assert!(app.filter_error.is_some());
+    }
+    #[test]
+    fn completion_preserves_quoted_context_and_exact_port_suggestions() {
+        let mut app = typing(
+            vec![socket("0.0.0.0:5001", "Acme Agent.exe", "42")],
+            "proc:\"Acme Agent.exe\" port:50",
+        );
+        assert_eq!(suggestions(&app), vec!["port:5001"]);
+        let _ = app.update(Message::SelectAutocomplete("port:5001".into()));
+        assert_eq!(app.filter_text_staged, "proc:\"Acme Agent.exe\" port:5001 ");
+        app.filter_text_staged = "proc:Acme".into();
+        assert_eq!(suggestions(&app), vec!["proc:\"Acme Agent.exe\""]);
+    }
+    #[test]
+    fn leaving_filter_for_settings_or_details_dismisses_completion() {
+        let mut app = typing(vec![socket("0.0.0.0:5001", "IFC8.exe", "42")], "proc:");
+        app.autocomplete_suggestions = app.generate_autocomplete();
+        assert!(!app.autocomplete_suggestions.is_empty());
+        let _ = app.update(Message::Settings);
+        assert!(app.autocomplete_suggestions.is_empty());
+        app.autocomplete_suggestions = app.generate_autocomplete();
+        let _ = app.update(Message::SelectConnection(None));
+        assert!(app.autocomplete_suggestions.is_empty());
+    }
+    #[test]
+    fn invalid_refresh_input_keeps_last_valid_interval_and_pause_clears_pending() {
+        let mut app = App::new(NativeFrame::default()).0;
+        for input in ["0", "", "3601", "999999999999999999999"] {
+            let _ = app.update(Message::RefreshIntervalChanged(input.into()));
+            assert_eq!(app.refresh_secs, 5);
+        }
+        let _ = app.update(Message::RefreshIntervalChanged("10".into()));
+        assert_eq!(app.refresh_secs, 10);
+        let id = app.inventory_gate.request().unwrap();
+        app.inventory_gate.request();
+        let _ = app.update(Message::AutoRefreshToggled(false));
+        assert_eq!(app.inventory_gate.finish(id), Some(false));
+    }
+    #[test]
+    fn sort_uses_numeric_pid_and_endpoint_port() {
+        let a = socket("127.0.0.1:9", "a", "9");
+        let b = socket("127.0.0.1:10", "B", "10");
+        let mut rows = vec![&b, &a];
+        for column in [2, 4] {
+            sort_rows(
+                &mut rows,
+                Sort {
+                    column,
+                    direction: Direction::Ascending,
+                },
+            );
+            assert_eq!(rows[0].pid, "9");
+            sort_rows(
+                &mut rows,
+                Sort {
+                    column,
+                    direction: Direction::Descending,
+                },
+            );
+            assert_eq!(rows[0].pid, "10");
+        }
+    }
+    #[test]
+    fn stale_inventory_and_analysis_results_cannot_replace_state() {
+        let mut app = App::new(NativeFrame::default()).0;
+        let id = app.inventory_gate.request().unwrap();
+        let _ = app.update(Message::InventoryReady(
+            id + 1,
+            Ok(Arc::new(Inventory::default())),
+        ));
+        assert!(app.inventory_gate.busy());
+        app.analysis_request = 2;
+        app.analysis_busy = true;
+        let key = ConnectionKey {
+            protocol: Protocol::Tcp,
+            local: "127.0.0.1:1".parse().unwrap(),
+            remote: None,
+            process: ProcessKey {
+                pid: 1,
+                created: Some(1),
+            },
+            ordinal: 0,
+        };
+        let _ = app.update(Message::AnalysisReady(
+            1,
+            key,
+            Ok(Arc::new(Analysis {
+                evaluator_version: 99,
+                ..Analysis::default()
+            })),
+        ));
+        assert!(!app.analysis_busy);
+        assert_eq!(app.analysis.evaluator_version, 0);
+    }
+    #[test]
+    fn large_connection_table_constructs_without_collecting() {
+        let mut app = App::new(NativeFrame::default()).0;
+        app.process_info = DataState::Loaded(Ok((0..10_000)
+            .map(|i| {
+                socket(
+                    &format!("127.0.0.1:{}", i + 1),
+                    "fixture.exe",
+                    &i.to_string(),
+                )
+            })
+            .collect()));
+        let _ = app.view();
+        assert!(!app.inventory_gate.busy());
+    }
+
     fn socket(local: &str, process: &str, pid: &str) -> SocketDisplay {
         SocketDisplay {
+            key: None,
             protocol: String::from("TCP"),
             state: String::from("Listen"),
             local_addr: String::from(local),
@@ -1210,7 +1182,11 @@ mod tests {
         let icon = window_icon().expect("the .ico decodes for the window");
         let (pixels, size) = icon.into_raw();
 
-        assert_eq!(size, iced::Size::new(256, 256), "expected the largest entry");
+        assert_eq!(
+            size,
+            iced::Size::new(256, 256),
+            "expected the largest entry"
+        );
         assert_eq!(pixels.len(), 256 * 256 * 4, "expected RGBA");
 
         assert!(

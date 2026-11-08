@@ -2,30 +2,28 @@
 name = "easy_netstat"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 
 [dependencies]
 iced = { version = "0.15.0-dev", features = [
     "tokio",
     "advanced",
-    "debug",
-    "canvas",
     "image",
     "svg",
-    "markdown",
-    "qr_code",
 ] }
-widgets = { path = "C:/Rust Projects/widgets", features = ["collapsible", "tree", "color_picker_two", "popover", "layer"]}
-advanced-table = { path = "C:/Rust Projects/advanced-table" }
-iced-native-frame = { path = "C:/Rust Projects/iced-window-decorations" }
-netstat2 = { version = "0.11.2" }
+widgets = { path = "../widgets", features = ["popover", "layer"]}
+advanced-table = { path = "../advanced-table" }
+iced-native-frame = { path = "../iced-window-decorations" }
 sysinfo = { version = "0.40" }
-# Decodes the multi-resolution .ico into the raw RGBA that iced's window Icon`n# and image Handle both want. Same 0.25 that iced already pulls in.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = "0.41"
+tokio = { version = "1", features = ["rt", "sync"] }
+# Decodes the multi-resolution .ico into RGBA for the window and title bar.
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 
-[build-dependencies]
-# iced_fontello 0.14 still generates `Font::with_name`, which iced master renamed
-# to `with_family`. Its master branch (0.15.0-dev) tracks the rename.
-iced_fontello = { git = "https://github.com/hecrj/iced_fontello.git", branch = "master" }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_System_Rpc", "Win32_Storage_FileSystem", "Win32_System_JobObjects"] }
 
 # Embeds the .ico into the exe's Win32 resources, which is where Windows looks
 # for the taskbar, Alt-Tab and Explorer icons.
@@ -38,4 +36,4 @@ winresource = "0.1"
 # even though `widgets` carries its own copy. Both crates then share one
 # `iced`, which is what keeps `Element` and `Theme` a single type across them.
 [patch.crates-io]
-iced = { git = "https://github.com/iced-rs/iced.git", branch = "master" }
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "8ff48c42b0d5188223501ea1ccc506fd5beaf36a" }

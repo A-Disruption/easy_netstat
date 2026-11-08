@@ -1,0 +1,10 @@
+//! Read-only Windows network diagnostics. OS collection is separate from pure evaluation.
+pub mod collectors;
+pub mod diagnostics;
+pub mod evidence;
+pub mod firewall;
+pub mod inventory;
+pub mod model;
+pub mod state;
+pub mod storage;
+pub mod wfp;
