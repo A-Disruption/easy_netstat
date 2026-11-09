@@ -99,6 +99,9 @@ impl App {
     }
     fn scenario(&self) -> Result<Scenario, String> {
         let c = self.selected.as_ref().ok_or("Select a connection")?;
+        if !self.direction_confirmed {
+            return Err("Choose Inbound or Outbound in Overview before evaluating firewall policy. A connection row does not establish traffic direction.".into());
+        }
         let local = self
             .local_input
             .parse()
@@ -179,6 +182,33 @@ impl App {
     }
     pub(super) fn update_workbench(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::RestartAsAdministrator => {
+                if self.elevation_busy || matches!(self.elevation_status, Ok(true)) {
+                    return Task::none();
+                }
+                self.elevation_busy = true;
+                self.status = "Waiting for Windows administrator approval… Cancelling keeps this session open.".into();
+                return Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(
+                            easy_netstat::elevation::restart_as_administrator,
+                        )
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::AdministratorRestartReady,
+                );
+            }
+            Message::AdministratorRestartReady(result) => {
+                if !self.elevation_busy {
+                    return Task::none();
+                }
+                self.elevation_busy = false;
+                match result {
+                    Ok(()) => return iced::exit(),
+                    Err(error) => self.status = error,
+                }
+            }
             Message::SelectConnection(key) => {
                 self.autocomplete_suggestions.clear();
                 self.autocomplete_selected_index = None;
@@ -188,6 +218,7 @@ impl App {
                 if let Some(cancel) = &self.diagnostic_cancel {
                     cancel.store(true, Ordering::Relaxed);
                 }
+                self.direction_confirmed = false;
                 self.selected =
                     key.and_then(|k| self.history.current.iter().find(|c| c.key == k).cloned());
                 self.diagnostic_data = None;
@@ -237,6 +268,39 @@ impl App {
                 self.selected_rule = None;
             }
             Message::RuleSelected(id) => self.selected_rule = Some(id),
+            Message::InspectFirewallRule(id) => {
+                if !self
+                    .diagnostic_data
+                    .as_ref()
+                    .is_some_and(|d| d.policy.rules.iter().any(|r| r.id == id))
+                {
+                    return Task::none();
+                }
+                self.rule_search.clear();
+                self.rule_candidates_only = true;
+                self.selected_rule = Some(id.clone());
+                if self.analysis.rules.iter().any(|e| {
+                    e.rule_id == id
+                        && e.relevance == Some(easy_netstat::firewall::Relevance::Uncertain)
+                }) {
+                    self.sections.insert("Unverified candidates".into());
+                }
+                let position = self.visible_rules().iter().position(|r| r.id == id);
+                if let Some(position) = position {
+                    self.rule_page = position / RULES_PER_PAGE;
+                } else {
+                    self.rule_candidates_only = false;
+                    self.rule_page = self
+                        .visible_rules()
+                        .iter()
+                        .position(|r| r.id == id)
+                        .unwrap_or(0)
+                        / RULES_PER_PAGE;
+                }
+                return self
+                    .update_workbench(Message::DiagnosticTabChanged(DiagnosticTab::Firewall));
+            }
+
             Message::CloseDetails => {
                 self.show_workbench = false;
                 if let Some(c) = &self.diagnostic_cancel {
@@ -325,6 +389,7 @@ impl App {
                         return Task::none();
                     }
                     "direction" => {
+                        self.direction_confirmed = matches!(value.as_str(), "Inbound" | "Outbound");
                         self.direction = if value == "Outbound" {
                             TrafficDirection::Outbound
                         } else {
@@ -444,7 +509,11 @@ impl App {
                     expected_port: self.expected_port.clone(),
                     peer: self.peer_input.clone(),
                     local: self.local_input.clone(),
-                    direction: self.direction.to_string(),
+                    direction: if self.direction_confirmed {
+                        self.direction.to_string()
+                    } else {
+                        String::new()
+                    },
                     interface: self.interface_input.clone(),
                 };
                 match self.preferences.save_view(view) {
@@ -482,6 +551,8 @@ impl App {
                     self.peer_input = v.peer;
                     self.local_input = v.local;
                     self.interface_input = v.interface;
+                    self.direction_confirmed =
+                        matches!(v.direction.as_str(), "Inbound" | "Outbound");
                     self.direction = if v.direction == "Outbound" {
                         TrafficDirection::Outbound
                     } else {
@@ -647,6 +718,7 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center),
                 tabs,
+                self.privilege_controls(),
                 text(&self.status).size(12).style(muted),
                 diagnostic_scroll(body).id(self.diagnostic_scroll_id.clone()),
                 text(
@@ -667,6 +739,36 @@ impl App {
             .on_dismiss(Message::CloseDetails)
             .boxed()
     }
+    fn privilege_controls(&self) -> Element<'_, Message> {
+        let (label, tone) = match &self.elevation_status {
+            Ok(true) => ("Administrator", Tone::Success),
+            Ok(false) => ("Standard user", Tone::Info),
+            Err(_) => ("Privilege status unavailable", Tone::Warning),
+        };
+        let mut controls = iced::widget::column![
+            row![
+                badge(label, tone),
+                space::horizontal(),
+                button(if self.elevation_busy {
+                    "Waiting for UAC…"
+                } else {
+                    "Restart as administrator"
+                })
+                .on_press_maybe(
+                    (!self.elevation_busy && !matches!(self.elevation_status, Ok(true)))
+                        .then_some(Message::RestartAsAdministrator)
+                )
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+        ]
+        .spacing(4);
+        if !matches!(self.elevation_status, Ok(true)) {
+            controls = controls.push(text("Restart requests Windows approval and clears unsaved session history/diagnostics. Saved files are kept on disk.").size(12).style(muted).boxed());
+        }
+        controls.boxed()
+    }
+
     fn no_collection(&self) -> Element<'_, Message> {
         let message = if self.selected.is_none() {
             "Select a connection in the table, then open Diagnostics. Saved views, snapshots, reports and DNS lookup are in Tools / reports."
@@ -785,23 +887,31 @@ impl App {
                 ]
                 .spacing(16),
                 row![
-                    text("Direction").size(12).style(muted),
+                    text("Direction (required)").size(12).style(muted),
                     button("Inbound")
-                        .style(if self.direction == TrafficDirection::Inbound {
-                            button::primary
-                        } else {
-                            button::secondary
-                        })
+                        .style(
+                            if self.direction_confirmed
+                                && self.direction == TrafficDirection::Inbound
+                            {
+                                button::primary
+                            } else {
+                                button::secondary
+                            }
+                        )
                         .on_press(Message::ScenarioChanged(
                             "direction".into(),
                             "Inbound".into()
                         )),
                     button("Outbound")
-                        .style(if self.direction == TrafficDirection::Outbound {
-                            button::primary
-                        } else {
-                            button::secondary
-                        })
+                        .style(
+                            if self.direction_confirmed
+                                && self.direction == TrafficDirection::Outbound
+                            {
+                                button::primary
+                            } else {
+                                button::secondary
+                            }
+                        )
                         .on_press(Message::ScenarioChanged(
                             "direction".into(),
                             "Outbound".into()
@@ -845,6 +955,13 @@ impl App {
             .spacing(4)
         ]
         .spacing(10);
+        if let Some(rule) = f.id.strip_prefix("policy.mismatch:") {
+            card = card.push(
+                button("Inspect this rule")
+                    .on_press(Message::InspectFirewallRule(rule.into()))
+                    .boxed(),
+            );
+        }
         if self.sections.contains("Evidence references") {
             card = card.push(
                 text(format!(
@@ -873,14 +990,32 @@ impl App {
             .analysis
             .rules
             .iter()
+            .filter(|e| {
+                e.relevance != Some(easy_netstat::firewall::Relevance::Uncertain)
+                    || self.sections.contains("Unverified candidates")
+            })
             .map(|e| e.rule_id.as_str())
             .collect();
-        data.policy
+        let mut rules: Vec<_> = data
+            .policy
             .rules
             .iter()
             .filter(|r| !self.rule_candidates_only || candidates.contains(r.id.as_str()))
             .filter(|r| rule_matches_query(r, &query))
-            .collect()
+            .collect();
+        if self.rule_candidates_only {
+            let order: std::collections::HashMap<_, _> = self
+                .analysis
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.rule_id.as_str(), i))
+                .collect();
+            rules.sort_by_key(|r| order.get(r.id.as_str()).copied().unwrap_or(usize::MAX));
+        } else {
+            rules.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+        }
+        rules
     }
     fn firewall_tab(&self) -> Element<'_, Message> {
         let Some(data) = &self.diagnostic_data else {
@@ -916,6 +1051,30 @@ impl App {
             .size(13)
         ]
         .spacing(12);
+        if let Err(error) = self.scenario() {
+            content = content.push(notice("Define the traffic scenario", error, Tone::Info));
+        }
+        if let Ok(scenario) = self.scenario() {
+            content = content.push(key_value(
+                "Examined traffic",
+                format!(
+                    "{} {} · {} → {}",
+                    scenario.direction,
+                    scenario.protocol,
+                    scenario.local,
+                    scenario
+                        .remote
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "unspecified peer".into())
+                ),
+            ));
+            if scenario.local.ip().is_unspecified()
+                || scenario.remote.is_none()
+                || scenario.profile.is_none()
+            {
+                content = content.push(notice("Scenario needs context", "Set the concrete local IP, peer and interface in Overview. Unknown inputs stay unknown; an incomplete candidate does not establish whether this traffic is permitted.", Tone::Warning));
+            }
+        }
         for cap in data
             .capabilities
             .iter()
@@ -973,7 +1132,7 @@ impl App {
                 .boxed(),
             );
         }
-        content=content.push(section("Firewall rules","Browse effective policy or narrow to the examined scenario. Select a rule to inspect each condition."));
+        content=content.push(section("Firewall rules","Relevant rules shows traffic candidates and identity-linked near matches. All collected includes unrelated policy. A rule failing a condition is not itself evidence of a communication problem."));
         content = content.push(
             row![
                 text_input(
@@ -988,7 +1147,7 @@ impl App {
                         button::secondary
                     })
                     .on_press(Message::RuleScopeChanged(false)),
-                button("Examined candidates")
+                button("Relevant rules")
                     .style(if self.rule_candidates_only {
                         button::primary
                     } else {
@@ -999,6 +1158,16 @@ impl App {
             .spacing(8)
             .boxed(),
         );
+        let unverified = self
+            .analysis
+            .rules
+            .iter()
+            .filter(|e| e.relevance == Some(easy_netstat::firewall::Relevance::Uncertain))
+            .count();
+        if self.rule_candidates_only && unverified > 0 {
+            content = content.push(text(format!("{unverified} additional rule(s) have unverified relevance because conditions are unreadable/unsupported. They remain included in analysis coverage counts.")).size(12).style(muted).boxed());
+            content = content.push(self.section_button("Unverified candidates"));
+        }
         let rules = self.visible_rules();
         let pages = rules.len().div_ceil(RULES_PER_PAGE).max(1);
         let page = self.rule_page.min(pages - 1);
@@ -1021,7 +1190,7 @@ impl App {
             .boxed(),
         );
         if rules.is_empty() {
-            return content.push(text(if data.policy.rules.is_empty(){"No rules are available in this collection. See the source status above; this is not proof that no firewall rules exist."}else if self.rule_candidates_only&&self.analysis.rules.is_empty(){"No analyzed candidates yet. Evaluate the traffic scenario in Overview, or choose All collected to browse the raw policy."}else{"No rules match this search/scope. Try All collected or clear the search."}).boxed()).boxed();
+            return content.push(text(if data.policy.rules.is_empty(){"No rules are available in this collection. See the source status above; this is not proof that no firewall rules exist."}else if self.rule_candidates_only&&self.analysis.rules.is_empty(){"No relevant rules in the current analysis. Evaluate the traffic scenario in Overview; All collected shows the full policy, including unrelated rules."}else{"No rules with verified relevance match this view. Review unverified candidates if offered, choose All collected, or clear the search. Absence here is not evidence of a block."}).boxed()).boxed();
         }
         let selected = self
             .selected_rule
@@ -1037,11 +1206,23 @@ impl App {
             list = list.push(
                 button(
                     text(format!(
-                        "{}\n{} · {} · {}",
+                        "{}\n{} · {} · {}\n{}",
                         rule.name,
                         rule.action,
                         rule.direction,
-                        if rule.enabled { "enabled" } else { "disabled" }
+                        if rule.enabled { "enabled" } else { "disabled" },
+                        self.analysis
+                            .rules
+                            .iter()
+                            .find(|e| e.rule_id == rule.id)
+                            .map(|e| match e.result {
+                                easy_netstat::firewall::Match::Match =>
+                                    "Evaluated conditions match",
+                                easy_netstat::firewall::Match::Mismatch =>
+                                    "Identity-linked near match",
+                                easy_netstat::firewall::Match::Unknown => "Incomplete evaluation",
+                            })
+                            .unwrap_or("Full policy entry")
                     ))
                     .size(13),
                 )
@@ -1150,6 +1331,11 @@ impl App {
             .ok()
             .map(|s| easy_netstat::firewall::evaluate(r, &s))
         {
+            details = details.push(notice(
+                if evaluation.relevance.is_some() { "Why this rule is relevant" } else { "Outside the relevant shortlist" },
+                evaluation.relevance.map(|r| r.reason()).unwrap_or("This rule is shown because All collected is selected. It is disabled or known conditions exclude this traffic, without a relevant identity-linked near match."),
+                Tone::Info,
+            ));
             details = details.push(section(
                 "Scenario evaluation",
                 "These results evaluate rule conditions, not actual traffic passage.",
@@ -1611,6 +1797,8 @@ mod tests {
         };
         app.history.current.push(c.clone());
         app.selected = Some(c);
+        app.rule_candidates_only = false;
+        app.direction_confirmed = true;
         app.local_input = "10.20.0.10:5001".into();
         let rules = (0..25)
             .map(|i| FirewallRule {
@@ -1782,5 +1970,97 @@ mod tests {
     fn missing_rule_filters_are_not_presented_as_any() {
         assert_eq!(values(&[]), "Unavailable / not collected");
         assert_eq!(values(&["Any".into()]), "Any");
+    }
+    #[test]
+    fn relevant_view_defaults_to_evidence_linked_rules_and_uncertain_is_optional() {
+        assert!(App::new(NativeFrame::default()).0.rule_candidates_only);
+        let mut app = fixture();
+        let mut data = Arc::unwrap_or_clone(app.diagnostic_data.take().unwrap());
+        data.policy.rules[0].program = vec!["%UNKNOWN%\\IFC8.exe".into()];
+        app.diagnostic_data = Some(Arc::new(data));
+        let s = app.scenario().unwrap();
+        let rules = &app.diagnostic_data.as_ref().unwrap().policy.rules;
+        app.analysis.rules = vec![
+            easy_netstat::firewall::evaluate(&rules[2], &s),
+            easy_netstat::firewall::evaluate(&rules[0], &s),
+        ];
+        let _ = app.update(Message::RuleScopeChanged(true));
+        assert_eq!(
+            app.visible_rules()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id-2"]
+        );
+        let _ = app.update(Message::ToggleSection("Unverified candidates".into()));
+        assert_eq!(
+            app.visible_rules()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id-2", "id-0"]
+        );
+        let _ = app.firewall_tab();
+        let _ = app.update(Message::RuleScopeChanged(false));
+        assert_eq!(app.visible_rules().len(), 25);
+    }
+    #[test]
+    fn cancelled_elevation_preserves_session_and_allows_retry() {
+        let mut app = fixture();
+        let selected = app.selected.as_ref().unwrap().key.clone();
+        app.elevation_status = Ok(false);
+        app.elevation_busy = true;
+        let _ = app.update(Message::AdministratorRestartReady(Err(
+            "UAC cancelled".into()
+        )));
+        assert!(!app.elevation_busy);
+        assert_eq!(app.status, "UAC cancelled");
+        assert_eq!(app.selected.as_ref().unwrap().key, selected);
+        assert!(app.diagnostic_data.is_some());
+        let _ = app.privilege_controls();
+        app.elevation_status = Ok(true);
+        let _ = app.update(Message::RestartAsAdministrator);
+        assert!(!app.elevation_busy); // never request UAC for an already elevated app
+        let _ = app.privilege_controls();
+    }
+    #[test]
+    fn firewall_direction_must_be_chosen_instead_of_implicitly_inbound() {
+        let mut app = fixture();
+        app.direction_confirmed = false;
+        assert!(
+            app.scenario()
+                .unwrap_err()
+                .contains("Choose Inbound or Outbound")
+        );
+        let _ = app.update(Message::EvaluateCached);
+        assert!(!app.analysis_busy);
+        assert!(app.analysis.findings.is_empty());
+        let _ = app.update(Message::ScenarioChanged(
+            "direction".into(),
+            "Outbound".into(),
+        ));
+        assert_eq!(
+            app.scenario().unwrap().direction,
+            TrafficDirection::Outbound
+        );
+        let _ = app.update(Message::ScenarioChanged(
+            "direction".into(),
+            "invalid".into(),
+        ));
+        assert!(app.scenario().is_err());
+    }
+    #[test]
+    fn inspecting_a_finding_opens_the_exact_rule_even_with_a_previous_filter() {
+        let mut app = fixture();
+        app.rule_search = "missing".into();
+        app.diagnostic_tab = DiagnosticTab::Overview;
+        let _ = app.update(Message::InspectFirewallRule("id-24".into()));
+        assert_eq!(app.diagnostic_tab, DiagnosticTab::Firewall);
+        assert!(app.rule_search.is_empty());
+        assert_eq!(app.selected_rule.as_deref(), Some("id-24"));
+        let visible = app.visible_rules();
+        let index = visible.iter().position(|r| r.id == "id-24").unwrap();
+        assert_eq!(app.rule_page, index / RULES_PER_PAGE);
+        let _ = app.firewall_tab();
     }
 }

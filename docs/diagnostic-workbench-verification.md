@@ -73,3 +73,14 @@ Enabled is green, Disabled is red, and unreadable/NotConfigured enabled values a
 The application entry point now selects the Windows GUI subsystem when Windows debug assertions are disabled (normal release builds). Debug builds keep the console subsystem. Existing diagnostic subprocesses already use CREATE_NO_WINDOW and were unchanged.
 
 Both locked offline release and debug builds passed. A direct PE-header check of the completed executables confirmed subsystem 2 (Windows GUI) for release and subsystem 3 (Windows console) for debug. Package formatting and whitespace checks passed. The application was not launched for this verification; the executable headers directly verify the subsystem setting responsible for Windows console allocation.
+
+
+## Firewall relevance and explicit administrator restart — 2026-11-09
+
+**91 tests passed**, 0 failed, 0 ignored: 58 library, 31 application/filter/UI, 2 Windows integration tests. Strict Clippy, package formatting, whitespace checks and the locked offline release build passed. A PE-header check confirmed the release remains subsystem 2 (Windows GUI).
+
+New checks cover unrelated program/direction/protocol/broad-scope exclusion, positive executable identity versus unresolved paths, service expectations, broad matching blocks, disabled rules, specific mismatch fields/inclusion reasons, nonmatching blocks not becoming issue findings, policy summary priority, ranking before the 2,000-candidate cap, default relevant/optional unverified browsing, explicit direction choice, exact-rule navigation despite an old search, readable token elevation, cancellation messages and simulated cancellation preserving the selected session. These tests do not invoke UAC or launch another GUI. No settings were modified or elevation prompt accepted during automated verification.
+
+The original candidate filter admitted broad rules based mainly on program/local-port tests and emitted ordinary exclusions as inferred findings. Evaluator version 2 links near-match findings to positive executable/scenario-service identity, separates unresolved relevance, names the excluding fields, and retains the full policy browser. Direction is no longer silently assumed Inbound. Unsupported conditions/partial policy still limit conclusions, and a missing match never confirms a block.
+
+The new administrator control discloses the session reset before invoking the standard Windows runas flow. Tests confirm cancellation/error reducer behavior; a real UAC approve/cancel interaction, new-window initialization, alternate credentials and post-elevation collection access remain manual acceptance items. The old app closes after Windows accepts the launch, not after an application-level readiness handshake. This change makes no claim that elevation guarantees access to all policy or Security records.

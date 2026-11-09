@@ -47,7 +47,7 @@ pub fn analyze(
     expected_port: Option<u16>,
 ) -> Analysis {
     let mut result = Analysis {
-        evaluator_version: 1,
+        evaluator_version: 2,
         ..Analysis::default()
     };
     let mut add = |id: &str,
@@ -238,15 +238,26 @@ pub fn analyze(
         .policy
         .rules
         .iter()
-        .filter(|r| firewall::relevant(r, s))
-        .take(2000)
         .map(|r| firewall::evaluate(r, s))
+        .filter(|e| e.relevance.is_some())
         .collect();
+    result
+        .rules
+        .sort_by(|a, b| firewall::priority(a).cmp(&firewall::priority(b)));
+    let candidates_capped = result.rules.len() > 2000;
+    result.rules.truncate(2000);
     for e in result
         .rules
         .iter()
-        .filter(|e| e.result == Match::Mismatch)
-        .take(20)
+        .filter(|e| {
+            e.result == Match::Mismatch
+                && e.action.eq_ignore_ascii_case("Allow")
+                && matches!(
+                    e.relevance,
+                    Some(firewall::Relevance::Application | firewall::Relevance::Service)
+                )
+        })
+        .take(10)
     {
         let mismatches = e
             .conditions
@@ -254,7 +265,22 @@ pub fn analyze(
             .filter(|c| c.result == Match::Mismatch)
             .map(|c| format!("{}: {}", c.name, c.detail))
             .collect::<Vec<_>>();
-        result.findings.push(Finding{id:format!("policy.mismatch:{}",e.rule_id),certainty:Certainty::Inferred,title:format!("{} rule '{}' does not match this scenario",e.action,e.rule_name),explanation:mismatches.join("; "),evidence:vec![policy_ref.clone(),format!("rule:{}",e.rule_id)],assumptions:vec!["Scenario values and collected policy are applicable at the examined time. Other rules may determine the outcome.".into()],follow_up:"Inspect other effective rules or existing block evidence; this mismatch alone does not establish a block.".into(),time_ms:data.finished_ms});
+        let fields = e
+            .conditions
+            .iter()
+            .filter(|c| c.result == Match::Mismatch)
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        result.findings.push(Finding {
+            id: format!("policy.mismatch:{}", e.rule_id), certainty: Certainty::Inferred,
+            title: format!("Allow rule '{}' excludes this traffic: {}", e.rule_name, fields),
+            explanation: format!("Why shown: {} Conditions excluding this traffic: {}", e.relevance.unwrap().reason(), mismatches.join("; ")),
+            evidence: vec![policy_ref.clone(), format!("rule:{}", e.rule_id)],
+            assumptions: vec!["This rule is only a potential intended exception. Other rules may allow the traffic; scenario inputs and collected policy must describe the examined attempt.".into()],
+            follow_up: "If this rule is intended to allow the communication, compare the listed restrictions with the actual peer/interface. Check matching allow candidates before treating this as a problem. A nonmatching rule does not prove a block.".into(),
+            time_ms: data.finished_ms,
+        });
     }
     let matched_allow = result
         .rules
@@ -265,7 +291,7 @@ pub fn analyze(
         .iter()
         .filter(|e| e.result == Match::Match && e.action.eq_ignore_ascii_case("Block"))
         .count();
-    let policy_coverage = data.policy.complete && result.rules.len() < 2000;
+    let policy_coverage = data.policy.complete && !candidates_capped;
     let title = if data.policy.collected_ms == 0 {
         "Effective firewall policy is unavailable"
     } else if matching_blocks > 0 {
@@ -275,11 +301,45 @@ pub fn analyze(
     } else {
         "No complete allow candidate found in collected policy"
     };
-    result.findings.push(Finding{id:"policy.summary".into(),certainty:Certainty::Inferred,title:title.into(),explanation:format!("Policy coverage {}; {} candidate rules examined. Configuration analysis cannot confirm a WFP block or guarantee passage. Unknown conditions, service hardening, IPsec, state and other providers can affect the outcome.",if policy_coverage{"collected (supported subset only)"}else{"partial/unavailable/capped"},result.rules.len()),evidence:vec![policy_ref],assumptions:vec![format!("Scenario {}.",if s.hypothetical{"contains user-supplied or assumed values"}else{"is observed"})],follow_up:"Use a concrete peer/interface and inspect a corresponding WFP failure event. No OS settings are changed.".into(),time_ms:data.finished_ms});
-    result.findings.sort_by_key(|f| match f.certainty {
-        Certainty::ConfirmedFailure => 0,
-        Certainty::Inferred => 1,
-        Certainty::Observed => 2,
+    let unknown = result
+        .rules
+        .iter()
+        .filter(|e| e.result == Match::Unknown)
+        .count();
+    let near = result
+        .rules
+        .iter()
+        .filter(|e| e.result == Match::Mismatch)
+        .count();
+    let allows = result
+        .rules
+        .iter()
+        .filter(|e| e.result == Match::Match && e.action.eq_ignore_ascii_case("Allow"))
+        .count();
+    let names = result
+        .rules
+        .iter()
+        .filter(|e| e.result == Match::Match)
+        .take(5)
+        .map(|e| format!("{}: {}", e.action, e.rule_name))
+        .collect::<Vec<_>>()
+        .join("; ");
+    result.findings.push(Finding {
+        id: "policy.summary".into(), certainty: if data.policy.collected_ms == 0 { Certainty::Observed } else { Certainty::Inferred }, title: title.into(),
+        explanation: format!("{} matching allow candidate(s), {} matching block candidate(s), {} incomplete candidate(s), {} identity-linked near match(es). {} Policy coverage {}. Unrelated rules are excluded from the shortlist. Configuration cannot confirm a block or guarantee passage.", allows, matching_blocks, unknown, near, if names.is_empty() { String::new() } else { format!("Matching rules: {}. ", names) }, if policy_coverage { "collected supported subset" } else { "partial/unavailable/capped" }),
+        evidence: vec![policy_ref], assumptions: vec![format!("Scenario {}. Unknown conditions, service hardening, IPsec and other providers may affect the outcome.", if s.hypothetical { "contains supplied or assumed values" } else { "is observed" })],
+        follow_up: "Review the Relevant rules shortlist and each inclusion reason. Supply a concrete peer/local interface and inspect corresponding WFP events for an observed traffic verdict.".into(), time_ms: data.finished_ms,
+    });
+
+    result.findings.sort_by_key(|f| {
+        (
+            match f.certainty {
+                Certainty::ConfirmedFailure => 0,
+                Certainty::Inferred => 1,
+                Certainty::Observed => 2,
+            },
+            if f.id == "policy.summary" { 0 } else { 1 },
+        )
     });
     result.findings.truncate(100);
     result
@@ -446,5 +506,82 @@ mod tests {
                 .iter()
                 .any(|f| f.id.starts_with("network."))
         );
+    }
+    #[test]
+    fn findings_explain_identity_link_and_only_meaningful_allow_exclusions() {
+        let c = crate::state::connection(42, Some(1), "Listen");
+        let s = crate::firewall::scenario();
+        let mut d = data();
+        let mut intended = crate::firewall::rule();
+        intended.id = "intended".into();
+        intended.remote_addresses = vec!["192.0.2.0/24".into()];
+        let mut unrelated = intended.clone();
+        unrelated.id = "unrelated".into();
+        unrelated.program = vec!["Any".into()];
+        let mut nonmatching_block = intended.clone();
+        nonmatching_block.id = "nonmatching-block".into();
+        nonmatching_block.action = "Block".into();
+        d.policy.rules = vec![unrelated, nonmatching_block, intended];
+        let a = analyze(&c, &s, &d, "", None);
+        let findings: Vec<_> = a
+            .findings
+            .iter()
+            .filter(|f| f.id.starts_with("policy.mismatch"))
+            .collect();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "policy.mismatch:intended");
+        assert!(findings[0].title.contains("Remote address"));
+        assert!(
+            findings[0]
+                .explanation
+                .contains("explicitly names this executable")
+        );
+        assert!(findings[0].explanation.contains("192.0.2.0/24"));
+        assert!(findings[0].explanation.contains("10.20.0.25"));
+        assert!(a.rules.iter().all(|e| e.rule_id != "unrelated"));
+        let summary = a
+            .findings
+            .iter()
+            .position(|f| f.id == "policy.summary")
+            .unwrap();
+        let mismatch = a
+            .findings
+            .iter()
+            .position(|f| f.id.starts_with("policy.mismatch"))
+            .unwrap();
+        assert!(summary < mismatch);
+        assert!(
+            a.findings
+                .iter()
+                .all(|f| f.certainty != Certainty::ConfirmedFailure)
+        );
+    }
+    #[test]
+    fn high_value_candidates_are_ranked_before_the_analysis_cap() {
+        let c = crate::state::connection(42, Some(1), "Listen");
+        let mut d = data();
+        d.policy.rules = (0..2001)
+            .map(|i| {
+                let mut r = crate::firewall::rule();
+                r.id = format!("uncertain-{i}");
+                r.program = vec!["Any".into()];
+                r.protocol.clear();
+                r
+            })
+            .collect();
+        let mut block = crate::firewall::rule();
+        block.id = "late-block".into();
+        block.action = "Block".into();
+        d.policy.rules.push(block);
+        let a = analyze(&c, &crate::firewall::scenario(), &d, "", None);
+        assert_eq!(a.rules.len(), 2000);
+        assert_eq!(a.rules[0].rule_id, "late-block");
+        let summary = a
+            .findings
+            .iter()
+            .find(|f| f.id == "policy.summary")
+            .unwrap();
+        assert!(summary.title.contains("block candidates"));
+        assert!(summary.explanation.contains("partial/unavailable/capped"));
     }
 }

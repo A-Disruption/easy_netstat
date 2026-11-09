@@ -89,6 +89,8 @@ fn title_bar_icon() -> Option<iced::widget::image::Handle> {
 #[derive(Debug, Clone)]
 enum Message {
     Settings,
+    RestartAsAdministrator,
+    AdministratorRestartReady(Result<(), String>),
     RefreshData,
     InventoryReady(u64, Result<Arc<Inventory>, String>),
     SelectConnection(Option<ConnectionKey>),
@@ -98,6 +100,7 @@ enum Message {
     RulePageChanged(usize),
     RuleScopeChanged(bool),
     RuleSelected(String),
+    InspectFirewallRule(String),
     CloseDetails,
     Diagnose(bool),
     EvaluateCached,
@@ -146,6 +149,8 @@ struct App {
     analysis_request: u64,
     analysis_busy: bool,
     show_workbench: bool,
+    elevation_status: Result<bool, String>,
+    elevation_busy: bool,
     diagnostic_tab: workbench_ui::DiagnosticTab,
     diagnostic_scroll_id: widget::Id,
     rule_search: String,
@@ -156,6 +161,7 @@ struct App {
     local_input: String,
     peer_input: String,
     direction: easy_netstat::model::Direction,
+    direction_confirmed: bool,
     interface_input: String,
     expected_service: String,
     expected_port: String,
@@ -249,16 +255,19 @@ impl App {
                 analysis_request: 0,
                 analysis_busy: false,
                 show_workbench: false,
+                elevation_status: easy_netstat::elevation::is_elevated(),
+                elevation_busy: false,
                 diagnostic_tab: workbench_ui::DiagnosticTab::Overview,
                 diagnostic_scroll_id: widget::Id::unique(),
                 rule_search: String::new(),
                 rule_page: 0,
-                rule_candidates_only: false,
+                rule_candidates_only: true,
                 selected_rule: None,
                 sections: BTreeSet::new(),
                 local_input: String::new(),
                 peer_input: String::new(),
                 direction: easy_netstat::model::Direction::Inbound,
+                direction_confirmed: false,
                 interface_input: String::new(),
                 expected_service: String::new(),
                 expected_port: String::new(),
@@ -412,13 +421,16 @@ impl App {
                     return self.start_inventory();
                 }
             }
-            other @ (Message::SelectConnection(_)
+            other @ (Message::RestartAsAdministrator
+            | Message::AdministratorRestartReady(_)
+            | Message::SelectConnection(_)
             | Message::ToggleWorkbench
             | Message::DiagnosticTabChanged(_)
             | Message::RuleSearchChanged(_)
             | Message::RulePageChanged(_)
             | Message::RuleScopeChanged(_)
             | Message::RuleSelected(_)
+            | Message::InspectFirewallRule(_)
             | Message::CloseDetails
             | Message::Diagnose(_)
             | Message::EvaluateCached

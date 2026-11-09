@@ -20,6 +20,32 @@ pub struct Condition {
     pub result: Match,
     pub detail: String,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Relevance {
+    Application,
+    Service,
+    Traffic,
+    Uncertain,
+}
+impl Relevance {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Application => {
+                "The rule explicitly names this executable; its direction and protocol do not exclude the examined traffic."
+            }
+            Self::Service => {
+                "The rule explicitly names the scenario service; that service identity is an assumption unless independently verified."
+            }
+            Self::Traffic => {
+                "All evaluated conditions match this traffic, including rules that apply to any executable."
+            }
+            Self::Uncertain => {
+                "No known condition excludes this traffic, but missing or unsupported conditions prevent a complete match. This is not a verified application-specific rule."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evaluation {
     pub rule_id: String,
@@ -27,6 +53,8 @@ pub struct Evaluation {
     pub action: String,
     pub result: Match,
     pub conditions: Vec<Condition>,
+    #[serde(default)]
+    pub relevance: Option<Relevance>,
 }
 
 fn all(values: impl Iterator<Item = Match>) -> Match {
@@ -344,30 +372,64 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
         },
     );
     let result = all(conditions.iter().map(|c| c.result));
+    let condition = |name: &str| conditions.iter().find(|c| c.name == name).unwrap().result;
+    let explicit_program = !rule.program.is_empty()
+        && rule.program.iter().all(|p| !unrestricted(p))
+        && condition("Program") == Match::Match;
+    let explicit_service = !rule.service.is_empty()
+        && rule.service.iter().all(|p| !unrestricted(p))
+        && condition("Service") == Match::Match;
+    let relevance = if !rule.enabled
+        || ["Program", "Direction", "Protocol"]
+            .iter()
+            .any(|n| condition(n) == Match::Mismatch)
+    {
+        None
+    } else if explicit_program {
+        Some(Relevance::Application)
+    } else if explicit_service {
+        Some(Relevance::Service)
+    } else if result == Match::Match {
+        Some(Relevance::Traffic)
+    } else if result == Match::Unknown {
+        Some(Relevance::Uncertain)
+    } else {
+        None
+    };
+
     Evaluation {
         rule_id: rule.id.clone(),
         rule_name: rule.name.clone(),
         action: rule.action.clone(),
         result,
         conditions,
+        relevance,
     }
 }
 
-/// Broad candidates (including unknown predicates) are always retained. A
-/// program-specific near match is retained to explain other mismatching fields.
+/// Shortlist traffic candidates and identity-backed near matches, never the
+/// unrelated direction/protocol/program rules in the full policy browser.
 pub fn relevant(rule: &FirewallRule, s: &Scenario) -> bool {
-    if !rule.enabled {
-        return false;
-    }
-    let p = program(&rule.program, s.program.as_deref());
-    if p == Match::Mismatch {
-        return false;
-    }
-    let ports = any(rule
-        .local_ports
-        .iter()
-        .map(|p| port_match(p, Some(s.local.port()))));
-    ports != Match::Mismatch || rule.program.iter().any(|p| !unrestricted(p))
+    evaluate(rule, s).relevance.is_some()
+}
+
+/// Stable ordering puts supported matching blocks/allows first, useful identity
+/// near matches next, and unreadable/unsupported candidates last.
+pub fn priority(e: &Evaluation) -> (u8, usize, &str) {
+    let rank = match (e.result, e.relevance) {
+        (Match::Match, _) if e.action.eq_ignore_ascii_case("Block") => 0,
+        (Match::Match, _) => 1,
+        (_, Some(Relevance::Application | Relevance::Service)) => 2,
+        _ => 3,
+    };
+    (
+        rank,
+        e.conditions
+            .iter()
+            .filter(|c| c.result == Match::Mismatch)
+            .count(),
+        &e.rule_id,
+    )
 }
 
 #[cfg(test)]
@@ -531,5 +593,63 @@ mod tests {
         r.local_ports = vec!["Any".into()];
         r.action = "Block".into();
         assert!(relevant(&r, &scenario()));
+    }
+    #[test]
+    fn unrelated_direction_protocol_program_and_broad_scope_are_not_shortlisted() {
+        let s = scenario();
+        for dimension in 0..4 {
+            let mut r = rule();
+            r.program = vec!["Any".into()];
+            match dimension {
+                0 => r.direction = "Outbound".into(),
+                1 => r.protocol = vec!["UDP".into()],
+                2 => r.program = vec!["C:\\Other.exe".into()],
+                _ => r.remote_addresses = vec!["192.0.2.0/24".into()],
+            }
+            assert_eq!(evaluate(&r, &s).relevance, None, "dimension {dimension}");
+        }
+    }
+    #[test]
+    fn identity_link_is_positive_not_guessed_from_unknown_paths() {
+        let mut r = rule();
+        r.local_ports = vec!["9999".into()];
+        assert_eq!(
+            evaluate(&r, &scenario()).relevance,
+            Some(Relevance::Application)
+        );
+        r.program = vec!["%UNKNOWN%\\IFC8.exe".into()];
+        assert_eq!(evaluate(&r, &scenario()).relevance, None);
+        r.local_ports = vec!["5001".into()];
+        assert_eq!(
+            evaluate(&r, &scenario()).relevance,
+            Some(Relevance::Uncertain)
+        );
+        let mut s = scenario();
+        s.program = None;
+        r = rule();
+        assert_eq!(evaluate(&r, &s).relevance, Some(Relevance::Uncertain));
+    }
+    #[test]
+    fn specific_service_requires_a_known_scenario_identity() {
+        let mut r = rule();
+        r.program = vec!["Any".into()];
+        r.service = vec!["OperaService".into()];
+        r.local_ports = vec!["9999".into()];
+        let mut s = scenario();
+        assert_eq!(evaluate(&r, &s).relevance, None);
+        s.service = Some("OperaService".into());
+        assert_eq!(evaluate(&r, &s).relevance, Some(Relevance::Service));
+    }
+    #[test]
+    fn broad_matching_blocks_survive_and_disabled_rules_do_not() {
+        let mut r = rule();
+        r.program = vec!["Any".into()];
+        r.action = "Block".into();
+        let block = evaluate(&r, &scenario());
+        assert_eq!(block.relevance, Some(Relevance::Traffic));
+        r.action = "Allow".into();
+        assert!(priority(&block) < priority(&evaluate(&r, &scenario())));
+        r.enabled = false;
+        assert_eq!(evaluate(&r, &scenario()).relevance, None);
     }
 }
