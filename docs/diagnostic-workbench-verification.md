@@ -50,3 +50,10 @@ The release executable remains `target/release/easy_netstat.exe`. Firewall colle
 - No rendered-window inspection was performed for this revision. The consolidated manual guide now includes resizing, light/dark readability, section grouping and color-independent status labels. Automated geometry/palette checks do not certify rendered text wrapping or accessibility contrast.
 
 The release executable is `target/release/easy_netstat.exe`. All work remains on `codex/diagnostic-workbench`; master is unchanged. No collector or firewall-evaluation behavior changed.
+
+
+## Reserved scrollbar space — 2026-11-09
+
+The shared diagnostic scroll area now uses Iced's embedded scrollbar layout (`spacing(8)`) instead of its default floating rail. When content overflows, layout reserves the default 10-pixel rail plus an 8-pixel gap; otherwise content gets the full width. This applies to every diagnostic tab without changing the popup's scroll identity or vertical expansion.
+
+**77 tests passed** (50 library, 25 application/UI, 2 Windows integration), with no failures or ignored tests. The new headless layout regression checks the content's right edge at narrow/wide widths and across scrollbar appearance, disappearance and reappearance. The existing vertical-resize regression now also uses this shared scroll-area builder. Strict Clippy, formatting, whitespace checks and the locked offline release build passed. Rendered-window inspection remains part of the final user acceptance pass.

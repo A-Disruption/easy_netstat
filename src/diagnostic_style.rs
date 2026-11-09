@@ -191,6 +191,15 @@ pub(super) fn detail_group(
         .style(|t: &Theme| Tone::Neutral.surface(t))
         .boxed()
 }
+/// Reserve a scrollbar lane instead of drawing the rail over rightmost controls.
+/// Iced's spacing includes the rail width and relayouts content when it appears.
+pub(super) fn diagnostic_scroll<'a, M, W>(body: W) -> iced::widget::Scrollable<'a, M, W, Theme> {
+    iced::widget::scrollable(body)
+        .spacing(8)
+        .width(Length::Fill)
+        .height(Length::Fill)
+}
+
 /// Fill the content area settled by the modal, rather than keeping a fixed
 /// height after the user resizes the surface.
 pub(super) fn expanding_body<W>(body: iced::widget::Column<W>) -> iced::widget::Column<W> {
@@ -205,7 +214,7 @@ mod tests {
     fn resized_body_and_remaining_content_grow_vertically() {
         let body = expanding_body(iced::widget::column![
             space::horizontal().height(40),
-            iced::widget::scrollable(space::horizontal().height(2000)).height(Length::Fill),
+            diagnostic_scroll(space::horizontal().height(2000)),
             space::horizontal().height(20)
         ]);
         let mut element: iced::Element<'_, (), Theme, ()> = iced::Widget::boxed(body);
@@ -235,6 +244,35 @@ mod tests {
         assert_eq!(tree.size, iced::Size::new(760.0, 300.0));
         assert_eq!(tree.children[1].size.height, initial - 100.0);
     }
+    #[test]
+    fn scrollbar_reserves_space_and_releases_it_when_content_fits() {
+        let mut element: iced::Element<'_, (), Theme, ()> =
+            iced::Widget::boxed(diagnostic_scroll(space::horizontal().height(600)));
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        element.diff(&mut tree);
+        // Reuse state through narrow/wide sizes and scrollbar visibility changes.
+        for (width, height, gutter) in [
+            (760.0, 300.0, 18.0),
+            (1040.0, 450.0, 18.0),
+            (760.0, 700.0, 0.0),
+            (760.0, 300.0, 18.0),
+        ] {
+            element.layout(
+                &mut tree,
+                &(),
+                &iced::advanced::layout::Limits::new(
+                    iced::Size::ZERO,
+                    iced::Size::new(width, height),
+                ),
+            );
+            assert_eq!(tree.size, iced::Size::new(width, height));
+            let content = &tree.children[0];
+            // 10px default rail + 8px spacing. Fill-width cards/controls must end
+            // before this lane; with no scrollbar they get the full width back.
+            assert_eq!(content.translation.x + content.size.width, width - gutter);
+        }
+    }
+
     #[test]
     fn certainty_and_conditions_have_different_semantics() {
         assert_eq!(

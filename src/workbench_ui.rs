@@ -1,10 +1,9 @@
 use super::*;
 use crate::diagnostic_style::{
-    Tone, badge, capability, certainty_tone, detail_group, expanding_body, key_value, match_tone,
-    metric, muted, notice, section,
+    Tone, badge, capability, certainty_tone, detail_group, diagnostic_scroll, expanding_body,
+    key_value, match_tone, metric, muted, notice, section,
 };
 use easy_netstat::model::Direction as TrafficDirection;
-use iced::widget::scrollable;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,32 +592,31 @@ impl App {
         .boxed()
     }
     pub(super) fn workbench_modal(&self) -> Element<'_, Message> {
-        let content: Element<'_, Message> =
-            if self.show_workbench {
-                let mut tabs = iced::widget::row![].spacing(4);
-                for tab in DiagnosticTab::ALL {
-                    tabs = tabs.push(
-                        button(tab.label())
-                            .padding([7, 10])
-                            .style(if self.diagnostic_tab == tab {
-                                button::primary
-                            } else {
-                                button::text
-                            })
-                            .on_press(Message::DiagnosticTabChanged(tab))
-                            .boxed(),
-                    );
-                }
-                let body = match self.diagnostic_tab {
-                    DiagnosticTab::Overview => self.overview_tab(),
-                    DiagnosticTab::Firewall => self.firewall_tab(),
-                    DiagnosticTab::Process => self.process_tab(),
-                    DiagnosticTab::Network => self.network_tab(),
-                    DiagnosticTab::Events => self.events_tab(),
-                    DiagnosticTab::History => self.history_tab(),
-                    DiagnosticTab::Tools => self.tools_tab(),
-                };
-                expanding_body(iced::widget::column![
+        let content: Element<'_, Message> = if self.show_workbench {
+            let mut tabs = iced::widget::row![].spacing(4);
+            for tab in DiagnosticTab::ALL {
+                tabs = tabs.push(
+                    button(tab.label())
+                        .padding([7, 10])
+                        .style(if self.diagnostic_tab == tab {
+                            button::primary
+                        } else {
+                            button::text
+                        })
+                        .on_press(Message::DiagnosticTabChanged(tab))
+                        .boxed(),
+                );
+            }
+            let body = match self.diagnostic_tab {
+                DiagnosticTab::Overview => self.overview_tab(),
+                DiagnosticTab::Firewall => self.firewall_tab(),
+                DiagnosticTab::Process => self.process_tab(),
+                DiagnosticTab::Network => self.network_tab(),
+                DiagnosticTab::Events => self.events_tab(),
+                DiagnosticTab::History => self.history_tab(),
+                DiagnosticTab::Tools => self.tools_tab(),
+            };
+            expanding_body(iced::widget::column![
                 row![
                     text(
                         self.selected
@@ -650,16 +648,17 @@ impl App {
                 .align_y(Alignment::Center),
                 tabs,
                 text(&self.status).size(12).style(muted),
-                scrollable(body).id(self.diagnostic_scroll_id.clone()).height(Length::Fill),
+                diagnostic_scroll(body).id(self.diagnostic_scroll_id.clone()),
                 text(
                     "Read-only · collection uses existing Windows configuration and recorded events"
                 )
-                .size(12).style(muted)
+                .size(12)
+                .style(muted)
             ])
-                .boxed()
-            } else {
-                space::horizontal().boxed()
-            };
+            .boxed()
+        } else {
+            space::horizontal().boxed()
+        };
         modal(content, "Diagnostics")
             .open(self.show_workbench)
             .min_width(760.0)
