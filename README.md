@@ -61,6 +61,8 @@ cargo clippy --locked --all-targets --no-deps -- -D warnings
 cargo fmt --package easy_netstat -- --check
 ```
 
+Windows release builds use the GUI subsystem and open without a console window; debug builds retain the console.
+
 Use `--offline` when dependencies are already cached. Windows integration tests open temporary loopback TCP/UDP sockets and query existing OS state. They never alter firewall/audit/service configuration. An OS sandbox that denies IP Helper or file replacement can prevent those tests from exercising the endpoint; run them in an ordinary development shell. Do not use `cargo fmt --all` to reformat external sibling repositories.
 
 See [implementation notes](docs/diagnostic-workbench-implementation.md) and the [consolidated Windows test guide](docs/diagnostic-workbench-testing.md). The five original audit documents describe baseline commit `02c1aa9`, before this implementation.

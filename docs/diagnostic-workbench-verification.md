@@ -66,3 +66,10 @@ Firewall profile cards now show independent activity and enabled-state pills. An
 Enabled is green, Disabled is red, and unreadable/NotConfigured enabled values are amber. These are configuration labels, not new confirmed-failure findings. The existing collectors and firewall settings are unchanged.
 
 **79 tests passed** (50 library, 27 application/UI, 2 Windows integration), with no failures or ignored tests. New tests cover True/False/unknown enabled states, multiple active profiles, DomainAuthenticated naming, disconnected adapters, partial/missing network coverage and unknown status/category. Strict Clippy, formatting, whitespace checks and locked offline release build passed. Rendered appearance still requires user acceptance review.
+
+
+## Release console suppression — 2026-11-09
+
+The application entry point now selects the Windows GUI subsystem when Windows debug assertions are disabled (normal release builds). Debug builds keep the console subsystem. Existing diagnostic subprocesses already use CREATE_NO_WINDOW and were unchanged.
+
+Both locked offline release and debug builds passed. A direct PE-header check of the completed executables confirmed subsystem 2 (Windows GUI) for release and subsystem 3 (Windows console) for debug. Package formatting and whitespace checks passed. The application was not launched for this verification; the executable headers directly verify the subsystem setting responsible for Windows console allocation.

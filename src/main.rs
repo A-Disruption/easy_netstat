@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use iced::event;
 use iced::keyboard;
 use iced::time::Instant;
