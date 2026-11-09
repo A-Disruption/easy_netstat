@@ -47,3 +47,12 @@ Tested sibling inputs (all three working trees clean when checked):
 | `widgets` | `2a0aa24ff091eaca352f82da1548ff4f5796786f` |
 | `advanced-table` | `b64c670d1f85661473d5189b8ddb9b1098fb3216` |
 | `iced-window-decorations` | `ecaff278111fa22c981624bdfb280f2fedfd49f6` |
+
+
+## Responsive diagnostic presentation — 2026-11-09
+
+`src/diagnostic_style.rs` centralizes theme-aware evidence/status tones, labeled badges, section headings, key/value groups, summary metrics and notices. The modal root requests Fill in both dimensions; its scroll area consumes the remaining height instead of retaining the old 590-pixel content height. No sibling modal code was changed.
+
+Overview leads with certainty counts and prioritized finding cards, each separating the explanation and next check; only six findings are expanded initially, with an All findings toggle. Evidence references remain optional. Firewall rule details separate application identity, traffic scope, profile/interface scope, policy provenance and per-condition evaluation. Process/service and network cards use subdued field labels and explicit status badges. Event records preserve their PID-only attribution caveat.
+
+Colors supplement explicit labels: confirmed failure red; inferred findings/limited collection amber; observed context blue; known availability/condition matches green; unknown conditions neutral. A green rule condition is configuration evidence and never an observed traffic verdict. Tones use the selected Iced theme palette. Collection, policy evaluation and permissions are unchanged.

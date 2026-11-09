@@ -29,6 +29,7 @@ use widgets::anchor::{Align, Side};
 use widgets::layer::modal;
 use widgets::popover::{self, popover};
 
+mod diagnostic_style;
 mod filter;
 mod icon;
 mod workbench_ui;

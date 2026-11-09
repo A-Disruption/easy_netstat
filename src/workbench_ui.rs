@@ -1,4 +1,8 @@
 use super::*;
+use crate::diagnostic_style::{
+    Tone, badge, capability, certainty_tone, detail_group, expanding_body, key_value, match_tone,
+    metric, muted, notice, section,
+};
 use easy_netstat::model::Direction as TrafficDirection;
 use iced::widget::scrollable;
 use std::path::PathBuf;
@@ -614,7 +618,7 @@ impl App {
                     DiagnosticTab::History => self.history_tab(),
                     DiagnosticTab::Tools => self.tools_tab(),
                 };
-                iced::widget::column![
+                expanding_body(iced::widget::column![
                 row![
                     text(
                         self.selected
@@ -645,16 +649,13 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center),
                 tabs,
-                text(&self.status).size(12),
+                text(&self.status).size(12).style(muted),
                 scrollable(body).id(self.diagnostic_scroll_id.clone()).height(Length::Fill),
                 text(
                     "Read-only · collection uses existing Windows configuration and recorded events"
                 )
-                .size(12)
-            ]
-                .spacing(12)
-                .width(960)
-                .height(590)
+                .size(12).style(muted)
+            ])
                 .boxed()
             } else {
                 space::horizontal().boxed()
@@ -673,31 +674,81 @@ impl App {
         } else {
             "Click Collect diagnostics to load effective firewall rules, process/services, network configuration and existing Windows events. No settings are changed."
         };
-        container(text(message).size(15))
-            .padding(16)
-            .style(container::bordered_box)
-            .width(Length::Fill)
-            .boxed()
+        notice("Getting started", message, Tone::Info)
     }
     fn overview_tab(&self) -> Element<'_, Message> {
-        let mut content =
-            iced::widget::column![text("Connection and examined traffic").size(18)].spacing(12);
+        let failures = self
+            .analysis
+            .findings
+            .iter()
+            .filter(|f| f.certainty == diagnostics::Certainty::ConfirmedFailure)
+            .count();
+        let inferred = self
+            .analysis
+            .findings
+            .iter()
+            .filter(|f| f.certainty == diagnostics::Certainty::Inferred)
+            .count();
+        let observed = self
+            .analysis
+            .findings
+            .iter()
+            .filter(|f| f.certainty == diagnostics::Certainty::Observed)
+            .count();
+        let mut content=iced::widget::column![section("Diagnostic summary","Evidence class and configuration state are separate. Color is always accompanied by a label."),
+            row![metric("Confirmed failures",failures,if failures>0{Tone::Danger}else{Tone::Neutral}),metric("Inferred findings",inferred,if inferred>0{Tone::Warning}else{Tone::Neutral}),metric("Observed facts",observed,Tone::Info)].spacing(12)].spacing(16);
+        if let Some(data) = &self.diagnostic_data {
+            let missing: Vec<_> = data
+                .capabilities
+                .iter()
+                .filter(|c| matches!(c.status.as_str(), "Unavailable" | "Partial" | "Ambiguous"))
+                .map(|c| c.source.as_str())
+                .collect();
+            if !missing.is_empty() {
+                content=content.push(notice("Collection is incomplete",format!("{} source(s) have limited data: {}. The corresponding tabs show the details.",missing.len(),missing.join(", ")),Tone::Warning));
+            }
+            content=content.push(text(format!("Collected {} seconds ago · {} rules · {} services · {} interfaces · {} recorded events",now_ms().saturating_sub(data.finished_ms)/1000,data.policy.rules.len(),data.services.len(),data.interfaces.len(),data.events.len())).size(12).style(muted).boxed());
+        } else {
+            content = content.push(self.no_collection());
+        }
+        content=content.push(section("Findings and next checks","Confirmed failures appear first. Inferred findings explain assumptions; observed facts provide context."));
+        if self.analysis.findings.is_empty() {
+            content=content.push(notice(if self.analysis_busy{"Analysis in progress"}else{"No analysis yet"},"Collect diagnostics and evaluate the traffic scenario below. An empty findings list does not confirm that communication is working.",Tone::Info));
+        }
+        let shown = if self.sections.contains("All findings") {
+            self.analysis.findings.len()
+        } else {
+            6
+        };
+        for finding in self.analysis.findings.iter().take(shown) {
+            content = content.push(self.finding_card(finding));
+        }
+        if self.analysis.findings.len() > 6 {
+            content = content.push(self.section_button("All findings"));
+        }
+        content = content.push(self.section_button("Evidence references"));
+        content=content.push(section("Examined traffic","These inputs describe your scenario; they are assumptions until supported by recorded evidence."));
         if let Some(c) = &self.selected {
-            content = content.push(
+            let form = iced::widget::column![
+                key_value(
+                    "Observed endpoint",
+                    format!(
+                        "{} {} → {} · {}",
+                        c.key.protocol,
+                        c.key.local,
+                        c.key
+                            .remote
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "peer unspecified".into()),
+                        c.state
+                    )
+                ),
                 text(format!(
-                    "{} · {} → {} · {}",
-                    c.key.protocol,
-                    c.key.local,
-                    c.key
-                        .remote
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|| "peer unspecified".into()),
-                    c.state
+                    "Endpoint sampled {} seconds ago",
+                    now_ms().saturating_sub(c.observed_ms) / 1000
                 ))
-                .boxed(),
-            );
-            content=content.push(text(format!("Observed {} seconds ago. Direction and values entered below are scenario assumptions.",now_ms().saturating_sub(c.observed_ms)/1000)).size(12).boxed());
-            content = content.push(
+                .size(12)
+                .style(muted),
                 row![
                     input(
                         "Local endpoint",
@@ -712,10 +763,7 @@ impl App {
                         "peer"
                     )
                 ]
-                .spacing(16)
-                .boxed(),
-            );
-            content = content.push(
+                .spacing(16),
                 row![
                     input(
                         "Interface",
@@ -736,12 +784,9 @@ impl App {
                         "port"
                     )
                 ]
-                .spacing(16)
-                .boxed(),
-            );
-            content = content.push(
+                .spacing(16),
                 row![
-                    text("Direction"),
+                    text("Direction").size(12).style(muted),
                     button("Inbound")
                         .style(if self.direction == TrafficDirection::Inbound {
                             button::primary
@@ -770,80 +815,54 @@ impl App {
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center)
-                .boxed(),
-            );
-        }
-        if let Some(data) = &self.diagnostic_data {
+            ]
+            .spacing(14);
             content = content.push(
-                row![
-                    button(text(format!(
-                        "Firewall rules: {} collected",
-                        data.policy.rules.len()
-                    )))
-                    .on_press(Message::DiagnosticTabChanged(DiagnosticTab::Firewall)),
-                    button(text(format!("Services: {}", data.services.len())))
-                        .on_press(Message::DiagnosticTabChanged(DiagnosticTab::Process)),
-                    button(text(format!("Interfaces: {}", data.interfaces.len())))
-                        .on_press(Message::DiagnosticTabChanged(DiagnosticTab::Network)),
-                    button(text(format!("Events: {}", data.events.len())))
-                        .on_press(Message::DiagnosticTabChanged(DiagnosticTab::Events))
-                ]
-                .spacing(8)
-                .boxed(),
+                container(form)
+                    .padding(16)
+                    .width(Length::Fill)
+                    .style(|t: &Theme| Tone::Neutral.surface(t))
+                    .boxed(),
             );
-            content=content.push(text(format!("Evidence collected {} seconds ago. Explore the tabs even when no rule can be fully evaluated.",now_ms().saturating_sub(data.finished_ms)/1000)).size(12).boxed());
-            for cap in data
-                .capabilities
-                .iter()
-                .filter(|c| c.status != "Available")
-                .take(6)
-            {
-                content = content.push(
-                    text(format!("{}: {} — {}", cap.source, cap.status, cap.detail))
-                        .size(12)
-                        .boxed(),
-                );
-            }
-        } else {
-            content = content.push(self.no_collection());
         }
-        content = content.push(text("Findings and next checks").size(18).boxed());
-        if self.analysis.findings.is_empty() {
-            content=content.push(text(if self.analysis_busy{"Evaluating evidence…"}else{"Collect diagnostics, then evaluate a concrete traffic scenario to generate findings."}).boxed());
-        }
-        for f in &self.analysis.findings {
-            let mut card = iced::widget::column![
-                text(format!("{} · {}", f.certainty, f.title)).font(Font {
+        content.boxed()
+    }
+    fn finding_card<'a>(&'a self, f: &'a diagnostics::Finding) -> Element<'a, Message> {
+        let tone = certainty_tone(f.certainty);
+        let mut card = iced::widget::column![
+            badge(f.certainty.to_string(), tone),
+            text(&f.title).size(16).font(Font {
+                weight: font::Weight::Bold,
+                ..Font::DEFAULT
+            }),
+            text(&f.explanation).size(14),
+            iced::widget::column![
+                text("NEXT CHECK").size(11).font(Font {
                     weight: font::Weight::Bold,
                     ..Font::DEFAULT
                 }),
-                text(&f.explanation).size(13),
-                text(format!("Next check: {}", f.follow_up)).size(13)
+                text(&f.follow_up).size(13)
             ]
-            .spacing(6);
-            if self.sections.contains("Evidence references") {
-                card = card.push(
-                    text(format!(
-                        "Evidence: {}\nAssumptions: {}\nEvaluator {} · {} ms UTC",
-                        f.evidence.join(", "),
-                        f.assumptions.join("; "),
-                        self.analysis.evaluator_version,
-                        f.time_ms
-                    ))
-                    .size(12)
-                    .boxed(),
-                );
-            }
-            content = content.push(
-                container(card)
-                    .padding(12)
-                    .width(Length::Fill)
-                    .style(container::bordered_box)
-                    .boxed(),
+            .spacing(4)
+        ]
+        .spacing(10);
+        if self.sections.contains("Evidence references") {
+            card = card.push(
+                text(format!(
+                    "Evidence: {}\nAssumptions: {}\nEvaluator {} · {} ms UTC",
+                    f.evidence.join(", "),
+                    f.assumptions.join("; "),
+                    self.analysis.evaluator_version,
+                    f.time_ms
+                ))
+                .size(12)
+                .boxed(),
             );
         }
-        content
-            .push(self.section_button("Evidence references"))
+        container(card)
+            .padding(16)
+            .width(Length::Fill)
+            .style(move |theme: &Theme| tone.surface(theme))
             .boxed()
     }
     fn visible_rules(&self) -> Vec<&FirewallRule> {
@@ -870,7 +889,13 @@ impl App {
         };
         let mut content = iced::widget::column![
             row![
-                text("Effective firewall policy").size(18),
+                text("Effective firewall policy")
+                    .size(19)
+                    .font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    })
+                    .style(text::primary),
                 space::horizontal(),
                 button("Refresh policy").on_press_maybe(
                     (self.selected.is_some() && !self.diagnostic_gate.busy())
@@ -898,11 +923,7 @@ impl App {
             .filter(|c| c.source == "Firewall" || c.source.starts_with("Get-NetFirewall"))
         {
             if cap.status != "Available" {
-                content = content.push(
-                    text(format!("{}: {} — {}", cap.source, cap.status, cap.detail))
-                        .size(12)
-                        .boxed(),
-                );
+                content = content.push(capability(cap));
             }
         }
         if data.policy.profiles.is_empty() {
@@ -910,9 +931,37 @@ impl App {
                 text("Firewall profile settings were not collected or could not be read.").boxed(),
             );
         }
+        content = content.push(section(
+            "Profile defaults",
+            "Profile settings are configuration evidence; interface profiles are shown in Network.",
+        ));
         for p in &data.policy.profiles {
-            content=content.push(container(iced::widget::column![text(format!("{} profile · enabled {}",p.name,p.enabled)).font(Font{weight:font::Weight::Bold,..Font::DEFAULT}),text(format!("Default inbound: {}    Default outbound: {}\nInbound rules: {}    Local rule merging: {}",p.inbound,p.outbound,p.allow_inbound_rules,p.allow_local_rules)).size(13)].spacing(5)).padding(10).width(Length::Fill).style(container::bordered_box).boxed());
+            content = content.push(
+                container(
+                    iced::widget::column![
+                        row![
+                            text(format!("{} profile", p.name)).size(16).font(Font {
+                                weight: font::Weight::Bold,
+                                ..Font::DEFAULT
+                            }),
+                            space::horizontal(),
+                            badge(format!("Enabled: {}", p.enabled), Tone::Info)
+                        ]
+                        .spacing(10),
+                        key_value("Default inbound", p.inbound.clone()),
+                        key_value("Default outbound", p.outbound.clone()),
+                        key_value("Inbound rules", p.allow_inbound_rules.clone()),
+                        key_value("Local rule merging", p.allow_local_rules.clone())
+                    ]
+                    .spacing(10),
+                )
+                .padding(14)
+                .width(Length::Fill)
+                .style(|t: &Theme| Tone::Neutral.surface(t))
+                .boxed(),
+            );
         }
+        content=content.push(section("Firewall rules","Browse effective policy or narrow to the examined scenario. Select a rule to inspect each condition."));
         content = content.push(
             row![
                 text_input(
@@ -1006,82 +1055,118 @@ impl App {
             .spacing(12)
             .boxed(),
         );
-        content.push(text("Collected policy is configuration evidence. A matching allow or block candidate is not an observed traffic verdict; unsupported or unreadable predicates remain unknown.").size(12).boxed()).boxed()
+        content.push(text("Collected policy is configuration evidence. A matching allow or block candidate is not an observed traffic verdict; unsupported or unreadable predicates remain unknown.").size(12).style(muted).boxed()).boxed()
     }
     fn rule_details<'a>(&'a self, r: &'a FirewallRule) -> Element<'a, Message> {
+        let action = if !r.enabled {
+            Tone::Neutral
+        } else if r.action.eq_ignore_ascii_case("Block") {
+            Tone::Danger
+        } else {
+            Tone::Success
+        };
         let mut details = iced::widget::column![
-            text(&r.name).size(18),
-            text(format!(
-                "{} · {} · {}",
-                r.action,
-                r.direction,
-                if r.enabled { "Enabled" } else { "Disabled" }
-            ))
-            .size(14),
-            text(format!("Rule ID: {}", r.id)).size(12)
-        ]
-        .spacing(8);
-        for (name, value) in [
-            ("Program", values(&r.program)),
-            ("Service restriction", values(&r.service)),
-            ("Protocol", values(&r.protocol)),
-            ("Local ports", values(&r.local_ports)),
-            ("Remote ports", values(&r.remote_ports)),
-            ("Local addresses", values(&r.local_addresses)),
-            ("Remote addresses", values(&r.remote_addresses)),
-            ("Profiles", values(&r.profiles)),
-            ("Interfaces", values(&r.interfaces)),
-            ("Interface types", values(&r.interface_types)),
-            ("Policy source", format!("{} / {}", r.source, r.source_type)),
-            ("Enforcement", r.enforcement.clone()),
-        ] {
-            details = details.push(
-                iced::widget::column![
-                    text(name)
-                        .font(Font {
-                            weight: font::Weight::Bold,
-                            ..Font::DEFAULT
-                        })
-                        .size(12),
-                    text(if value.is_empty() {
-                        "Unavailable".into()
+            text(&r.name).size(20).font(Font {
+                weight: font::Weight::Bold,
+                ..Font::DEFAULT
+            }),
+            row![
+                badge(format!("Configured {}", r.action), action),
+                badge(r.direction.clone(), Tone::Info),
+                badge(
+                    if r.enabled { "Enabled" } else { "Disabled" },
+                    if r.enabled {
+                        Tone::Success
                     } else {
-                        value
-                    })
-                    .size(13)
+                        Tone::Neutral
+                    }
+                )
+            ]
+            .spacing(6),
+            detail_group(
+                "Application identity",
+                vec![
+                    ("Program", values(&r.program)),
+                    ("Service restriction", values(&r.service))
                 ]
-                .spacing(3)
-                .boxed(),
-            );
-        }
+            ),
+            detail_group(
+                "Traffic scope",
+                vec![
+                    ("Protocol", values(&r.protocol)),
+                    ("Local ports", values(&r.local_ports)),
+                    ("Remote ports", values(&r.remote_ports)),
+                    ("Local addresses", values(&r.local_addresses)),
+                    ("Remote addresses", values(&r.remote_addresses))
+                ]
+            ),
+            detail_group(
+                "Where this rule applies",
+                vec![
+                    ("Profiles", values(&r.profiles)),
+                    ("Interfaces", values(&r.interfaces)),
+                    ("Interface types", values(&r.interface_types))
+                ]
+            ),
+            detail_group(
+                "Policy provenance",
+                vec![
+                    ("Rule ID", r.id.clone()),
+                    ("Policy source", r.source.clone()),
+                    ("Source type", r.source_type.clone()),
+                    ("Enforcement", r.enforcement.clone())
+                ]
+            )
+        ]
+        .spacing(14);
         if !r.unsupported.is_empty() {
-            details = details.push(
-                text(format!(
-                    "Unsupported conditions: {}",
-                    r.unsupported.join("; ")
-                ))
-                .size(12)
-                .boxed(),
-            );
+            details = details.push(notice(
+                "Unsupported conditions",
+                r.unsupported.join("; "),
+                Tone::Warning,
+            ));
         }
         if !r.complete {
-            details=details.push(text("Some associated filters could not be read. Missing values are unknown, not Any.").size(12).boxed());
+            details = details.push(notice(
+                "Rule data is incomplete",
+                "Some associated filters could not be read. Missing values are unknown, not Any.",
+                Tone::Warning,
+            ));
         }
         if let Some(evaluation) = self
             .scenario()
             .ok()
             .map(|s| easy_netstat::firewall::evaluate(r, &s))
         {
-            details = details.push(
-                text(format!("Examined scenario: {}", evaluation.result))
-                    .size(16)
-                    .boxed(),
-            );
+            details = details.push(section(
+                "Scenario evaluation",
+                "These results evaluate rule conditions, not actual traffic passage.",
+            ));
+            details = details.push(badge(
+                format!("Configuration: {}", evaluation.result),
+                match_tone(evaluation.result),
+            ));
             for c in evaluation.conditions {
                 details = details.push(
-                    text(format!("{}: {} — {}", c.name, c.result, c.detail))
-                        .size(12)
-                        .boxed(),
+                    container(
+                        iced::widget::column![
+                            row![
+                                text(c.name).size(13).font(Font {
+                                    weight: font::Weight::Bold,
+                                    ..Font::DEFAULT
+                                }),
+                                space::horizontal(),
+                                badge(c.result.to_string(), match_tone(c.result))
+                            ]
+                            .spacing(10),
+                            text(c.detail).size(12).style(muted)
+                        ]
+                        .spacing(6),
+                    )
+                    .padding(10)
+                    .width(Length::Fill)
+                    .style(|t: &Theme| Tone::Neutral.surface(t))
+                    .boxed(),
                 );
             }
         }
@@ -1089,20 +1174,31 @@ impl App {
     }
     fn process_tab(&self) -> Element<'_, Message> {
         let mut content =
-            iced::widget::column![text("Owning process and associated services").size(18)]
+            iced::widget::column![section("Owning process and associated services","Process identity and service membership are collected separately from socket ownership.")]
                 .spacing(12);
         if let Some(c) = &self.selected {
-            content = content.push(
-                text(format!(
-                    "{} · PID {}\nExecutable: {}\nCreation identity: {:?}\n{}",
-                    c.process.name,
-                    c.key.process.pid,
-                    c.process.path.as_deref().unwrap_or("Unavailable"),
-                    c.key.process.created,
-                    c.process.unavailable.join("; ")
-                ))
-                .boxed(),
-            );
+            content = content.push(detail_group(
+                "Process identity",
+                vec![
+                    ("Name", c.process.name.clone()),
+                    ("PID", c.key.process.pid.to_string()),
+                    (
+                        "Executable",
+                        c.process
+                            .path
+                            .clone()
+                            .unwrap_or_else(|| "Unavailable".into()),
+                    ),
+                    ("Creation identity", format!("{:?}", c.key.process.created)),
+                ],
+            ));
+            if !c.process.unavailable.is_empty() {
+                content = content.push(notice(
+                    "Limited process data",
+                    c.process.unavailable.join("; "),
+                    Tone::Warning,
+                ));
+            }
         }
         let Some(data) = &self.diagnostic_data else {
             return content.push(self.no_collection()).boxed();
@@ -1128,20 +1224,49 @@ impl App {
         if data.services.is_empty() {
             content=content.push(text("No visible associated/expected services were returned. Check collection access below.").boxed());
         }
+        content=content.push(section("Associated services", "A shared PID can host several services. Membership alone does not identify the service owning a socket."));
         for s in &data.services {
-            content=content.push(container(iced::widget::column![text(format!("{} ({})",s.display_name,s.name)).size(16),text(format!("State: {} · start type: {} · PID {}\nConfigured account: {}\nConfigured binary: {}",s.state,s.start_mode,s.pid,s.account,s.binary)).size(13)].spacing(6)).padding(12).style(container::bordered_box).width(Length::Fill).boxed());
+            content = content.push(
+                container(
+                    iced::widget::column![
+                        row![
+                            text(format!("{} ({})", s.display_name, s.name))
+                                .size(16)
+                                .font(Font {
+                                    weight: font::Weight::Bold,
+                                    ..Font::DEFAULT
+                                }),
+                            space::horizontal(),
+                            badge(
+                                s.state.clone(),
+                                if s.state.eq_ignore_ascii_case("Running") {
+                                    Tone::Success
+                                } else {
+                                    Tone::Warning
+                                }
+                            )
+                        ]
+                        .spacing(10),
+                        key_value("Start type", s.start_mode.clone()),
+                        key_value("PID", s.pid.to_string()),
+                        key_value("Service account", s.account.clone()),
+                        key_value("Configured binary", s.binary.clone())
+                    ]
+                    .spacing(10),
+                )
+                .padding(14)
+                .width(Length::Fill)
+                .style(|t: &Theme| Tone::Neutral.surface(t))
+                .boxed(),
+            );
         }
-        content=content.push(text("A shared PID can host several services. Membership does not establish which service owns a socket; executable and service firewall restrictions are separate conditions.").size(12).boxed());
+        content=content.push(text("Executable and service firewall restrictions are evaluated as separate conditions.").size(12).style(muted).boxed());
         for cap in data
             .capabilities
             .iter()
             .filter(|c| c.source.starts_with("Process") || c.source == "Services")
         {
-            content = content.push(
-                text(format!("{}: {} — {}", cap.source, cap.status, cap.detail))
-                    .size(12)
-                    .boxed(),
-            );
+            content = content.push(capability(cap));
         }
         content.boxed()
     }
@@ -1149,31 +1274,65 @@ impl App {
         let Some(data) = &self.diagnostic_data else {
             return self.no_collection();
         };
-        let mut content =
-            iced::widget::column![text("Interfaces, profiles and DNS configuration").size(18)]
-                .spacing(12);
+        let mut content = iced::widget::column![section(
+            "Interfaces, profiles and DNS configuration",
+            "Current configuration provides context for the examined endpoint."
+        )]
+        .spacing(12);
         for cap in data
             .capabilities
             .iter()
             .filter(|c| c.source == "Network" || c.source == "Routes")
         {
-            content = content.push(
-                text(format!("{}: {} — {}", cap.source, cap.status, cap.detail))
-                    .size(12)
-                    .boxed(),
-            );
+            content = content.push(capability(cap));
         }
         for i in &data.interfaces {
-            content=content.push(container(iced::widget::column![text(format!("{} · #{} · {} · {} profile",i.alias,i.index,i.status,i.profile)).size(16),text(format!("Type: {}\nAddresses: {}\nDNS servers: {}\nGateways: {}\nAbsolute error counter: {:?}",i.kind,values(&i.addresses),values(&i.dns),values(&i.gateways),i.errors)).size(13)].spacing(6)).padding(12).width(Length::Fill).style(container::bordered_box).boxed());
+            content = content.push(
+                container(
+                    iced::widget::column![
+                        row![
+                            text(format!("{} · #{}", i.alias, i.index))
+                                .size(16)
+                                .font(Font {
+                                    weight: font::Weight::Bold,
+                                    ..Font::DEFAULT
+                                }),
+                            space::horizontal(),
+                            badge(
+                                i.status.clone(),
+                                if i.status.eq_ignore_ascii_case("Up") {
+                                    Tone::Success
+                                } else {
+                                    Tone::Warning
+                                }
+                            ),
+                            badge(format!("{} profile", i.profile), Tone::Info)
+                        ]
+                        .spacing(8),
+                        key_value("Type", i.kind.clone()),
+                        key_value("Addresses", values(&i.addresses)),
+                        key_value("DNS servers", values(&i.dns)),
+                        key_value("Gateways", values(&i.gateways)),
+                        key_value(
+                            "Error counter",
+                            format!("{:?} (absolute, not a rate)", i.errors)
+                        )
+                    ]
+                    .spacing(10),
+                )
+                .padding(14)
+                .width(Length::Fill)
+                .style(|t: &Theme| Tone::Neutral.surface(t))
+                .boxed(),
+            );
         }
-        content = content.push(
-            text(format!(
-                "Routing information · {} collected routes",
+        content = content.push(section(
+            "Routing information",
+            format!(
+                "{} collected routes. Current routes do not prove a historical packet path.",
                 data.routes.len()
-            ))
-            .size(18)
-            .boxed(),
-        );
+            ),
+        ));
         for r in data.routes.iter().take(80) {
             content = content.push(
                 text(format!(
@@ -1193,17 +1352,13 @@ impl App {
         let Some(data) = &self.diagnostic_data else {
             return self.no_collection();
         };
-        let mut content=iced::widget::column![text("Recorded traffic and system evidence").size(18),text("No recorded event is different from denied access or disabled auditing. No new auditing is enabled by this tool.").size(13)].spacing(12);
+        let mut content=iced::widget::column![section("Recorded traffic and system evidence","No recorded event is different from denied access or disabled auditing. No new auditing is enabled by this tool.")].spacing(12);
         for cap in data
             .capabilities
             .iter()
             .filter(|c| c.source.contains("events") || c.source == "Audit policy")
         {
-            content = content.push(
-                text(format!("{}: {} — {}", cap.source, cap.status, cap.detail))
-                    .size(12)
-                    .boxed(),
-            );
+            content = content.push(capability(cap));
         }
         let mut count = 0;
         for event in data
@@ -1218,7 +1373,7 @@ impl App {
             .take(50)
         {
             count += 1;
-            content=content.push(container(text(format!("Event {} · {} ms UTC · PID {:?}\n{} → {} · {:?} · {:?}\nFilter {:?} · {}\nPID-only event context; confirmed attribution requires the full tuple and process lifetime.",event.event_id,event.time_ms,event.pid,event.source.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()),event.destination.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()),event.direction,event.protocol,event.filter_id,event.layer)).size(13)).padding(12).width(Length::Fill).style(container::bordered_box).boxed());
+            content=content.push(container(iced::widget::column![row![text(format!("Event {}",event.event_id)).size(16).font(Font{weight:font::Weight::Bold,..Font::DEFAULT}),space::horizontal(),badge("PID-only context",Tone::Info)].spacing(8),key_value("Time",format!("{} ms UTC",event.time_ms)),key_value("Traffic",format!("{} → {}",event.source.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()),event.destination.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()))),key_value("Direction / protocol",format!("{:?} / {:?}",event.direction,event.protocol)),key_value("Filter / layer",format!("{:?} / {}",event.filter_id,event.layer)),text("Confirmed attribution requires the full traffic tuple and process lifetime.").size(12).style(muted)].spacing(10)).padding(14).width(Length::Fill).style(|t:&Theme|Tone::Neutral.surface(t)).boxed());
         }
         if count == 0 {
             content=content.push(text("No recorded WFP events for this PID in the collected window. This does not prove traffic was allowed.").boxed());
@@ -1229,19 +1384,12 @@ impl App {
             .iter()
             .filter(|f| f.id.starts_with("wfp.") || f.id == "system.context")
         {
-            content = content.push(
-                text(format!(
-                    "{} · {}\n{}\nEvidence: {}",
-                    f.certainty,
-                    f.title,
-                    f.explanation,
-                    f.evidence.join(", ")
-                ))
-                .size(13)
-                .boxed(),
-            );
+            content = content.push(self.finding_card(f));
         }
-        content = content.push(text("Current WFP filter metadata").size(18).boxed());
+        content = content.push(section(
+            "Current WFP filter metadata",
+            "Runtime IDs may expire after policy or engine changes.",
+        ));
         for f in &data.filters {
             content = content.push(
                 text(format!(
@@ -1258,7 +1406,7 @@ impl App {
         content.boxed()
     }
     fn history_tab(&self) -> Element<'_, Message> {
-        let mut content=iced::widget::column![text("Recent connection history").size(18),text("Sampled changes may miss short-lived connections; disappearance is not proof of graceful closure or a crash.").size(13)].spacing(12);
+        let mut content=iced::widget::column![section("Recent connection history","Sampled changes may miss short-lived connections; disappearance is not proof of graceful closure or a crash.")].spacing(12);
         if let Some(c) = &self.selected {
             for change in self
                 .history
@@ -1287,8 +1435,8 @@ impl App {
             .iter()
             .map(|v| v.name.clone())
             .collect();
-        let mut content=iced::widget::column![text("Saved diagnostic views").size(18),row![text_input("Diagnostic view name",&self.view_name).on_input(Message::ViewNameChanged),button("Save view").on_press_maybe(self.preferences_ready.then_some(Message::SaveView)),pick_list(self.loaded_view.as_ref(),names,|s:&String|s.clone()).placeholder("Load saved view").on_select(Message::LoadView)].spacing(8),
-            text("Baselines and reports").size(18),text_input("Full file path",&self.file_path).on_input(|v|Message::ScenarioChanged("file".into(),v)),
+        let mut content=iced::widget::column![section("Saved diagnostic views","Reuse a focused troubleshooting scenario."),row![text_input("Diagnostic view name",&self.view_name).on_input(Message::ViewNameChanged),button("Save view").on_press_maybe(self.preferences_ready.then_some(Message::SaveView)),pick_list(self.loaded_view.as_ref(),names,|s:&String|s.clone()).placeholder("Load saved view").on_select(Message::LoadView)].spacing(8),
+            section("Baselines and reports","Capture a reference point, compare changes or export a redacted summary."),text_input("Full file path",&self.file_path).on_input(|v|Message::ScenarioChanged("file".into(),v)),
             row![button("Capture baseline").on_press(Message::CaptureSnapshot),button("Save full snapshot").on_press(Message::SaveSnapshot),button("Load baseline JSON").on_press(Message::LoadSnapshot),button("Compare current").on_press_maybe(self.snapshot.as_ref().map(|_|Message::CompareSnapshot))].spacing(8),
             text("Full snapshots contain addresses, paths and collected policy/network details. Existing files are preserved.").size(12),
             button("Export redacted report").on_press_maybe((self.diagnostic_data.is_some()&&!self.analysis.findings.is_empty()).then_some(Message::ExportReport)),
@@ -1299,11 +1447,10 @@ impl App {
             content = content.push(text(storage::report(&self.analysis, data)).size(12).boxed());
         }
         content = content
-            .push(
-                text("Optional DNS lookup (network activity)")
-                    .size(18)
-                    .boxed(),
-            )
+            .push(section(
+                "Optional DNS lookup",
+                "Resolving a hostname initiates network activity.",
+            ))
             .push(
                 row![
                     text_input("Hostname", &self.dns_name).on_input(Message::DnsChanged),
@@ -1324,7 +1471,7 @@ fn input<'a>(
     key: &'static str,
 ) -> Element<'a, Message> {
     iced::widget::column![
-        text(label).size(12),
+        text(label).size(12).style(muted),
         text_input(placeholder, value)
             .on_input(move |v| Message::ScenarioChanged(key.into(), v))
             .padding(7)

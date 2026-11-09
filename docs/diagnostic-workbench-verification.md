@@ -39,3 +39,14 @@ Verification for this revision:
 - The rendered-window check through the computer-use skill could not launch the application because app approval timed out. No visual layout verification is claimed; the automated tests exercise state transitions and widget construction, not rendered geometry.
 
 The release executable remains `target/release/easy_netstat.exe`. Firewall collection and diagnostic certainty rules were not changed by this UI revision.
+
+
+## Popup sizing and visual hierarchy — 2026-11-09
+
+- **76 tests passed**, 0 failed, 0 ignored: 50 library, 24 application/filter/UI, 2 Windows integration tests.
+- New headless layout regression uses the same expanding-body helper as the modal with an actual scrollable child. Growing from 900×400 to 1100×650 adds exactly 250 pixels to the scroll viewport, leaves fixed header/footer heights intact, and shrinking to 760×300 reduces the viewport accordingly.
+- New semantic tests keep configuration mismatches distinct from confirmed failures and unknown predicates distinct from matches. Theme tests cover Light, Dark and Nord palettes and distinguish evidence/status surfaces.
+- Strict Clippy, package formatting, diff whitespace checks and locked offline release build passed. Sandbox hard-link cache warnings only affected incremental cache copying.
+- No rendered-window inspection was performed for this revision. The consolidated manual guide now includes resizing, light/dark readability, section grouping and color-independent status labels. Automated geometry/palette checks do not certify rendered text wrapping or accessibility contrast.
+
+The release executable is `target/release/easy_netstat.exe`. All work remains on `codex/diagnostic-workbench`; master is unchanged. No collector or firewall-evaluation behavior changed.

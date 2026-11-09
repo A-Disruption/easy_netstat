@@ -1,0 +1,282 @@
+//! Shared diagnostic presentation: colors describe evidence/condition states,
+//! never upgrade a configuration inference into a confirmed traffic failure.
+use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tone {
+    Neutral,
+    Info,
+    Success,
+    Warning,
+    Danger,
+}
+impl Tone {
+    fn pair(self, theme: &Theme) -> iced::theme::palette::Pair {
+        let p = theme.palette();
+        match self {
+            Self::Neutral => p.background.weak,
+            Self::Info => p.primary.weak,
+            Self::Success => p.success.weak,
+            Self::Warning => p.warning.weak,
+            Self::Danger => p.danger.weak,
+        }
+    }
+    pub(super) fn surface(self, theme: &Theme) -> container::Style {
+        let pair = self.pair(theme);
+        let p = theme.palette();
+        let accent = match self {
+            Self::Neutral => p.background.strong.color,
+            Self::Info => p.primary.base.color,
+            Self::Success => p.success.base.color,
+            Self::Warning => p.warning.base.color,
+            Self::Danger => p.danger.base.color,
+        };
+        container::Style {
+            background: Some(pair.color.into()),
+            text_color: Some(pair.text),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: accent,
+            },
+            ..container::Style::default()
+        }
+    }
+}
+pub(super) fn certainty_tone(c: diagnostics::Certainty) -> Tone {
+    match c {
+        diagnostics::Certainty::Observed => Tone::Info,
+        diagnostics::Certainty::Inferred => Tone::Warning,
+        diagnostics::Certainty::ConfirmedFailure => Tone::Danger,
+    }
+}
+pub(super) fn match_tone(m: easy_netstat::firewall::Match) -> Tone {
+    match m {
+        easy_netstat::firewall::Match::Match => Tone::Success,
+        easy_netstat::firewall::Match::Mismatch => Tone::Warning,
+        easy_netstat::firewall::Match::Unknown => Tone::Neutral,
+    }
+}
+pub(super) fn capability_tone(status: &str) -> Tone {
+    match status {
+        "Available" => Tone::Success,
+        "Partial" | "Unavailable" | "Ambiguous" => Tone::Warning,
+        _ => Tone::Neutral,
+    }
+}
+pub(super) fn muted(theme: &Theme) -> text::Style {
+    let p = theme.palette().background.base;
+    text::Style {
+        color: Some(p.text.mix(p.color, 0.28)),
+        ..text::Style::default()
+    }
+}
+pub(super) fn badge(label: impl Into<String>, tone: Tone) -> Element<'static, Message> {
+    container(text(label.into()).size(12).font(Font {
+        weight: font::Weight::Bold,
+        ..Font::DEFAULT
+    }))
+    .padding([4, 8])
+    .style(move |theme: &Theme| tone.surface(theme))
+    .boxed()
+}
+pub(super) fn section(
+    title: impl Into<String>,
+    subtitle: impl Into<String>,
+) -> Element<'static, Message> {
+    iced::widget::column![
+        text(title.into())
+            .size(19)
+            .font(Font {
+                weight: font::Weight::Bold,
+                ..Font::DEFAULT
+            })
+            .style(text::primary),
+        text(subtitle.into()).size(12).style(muted),
+        iced::widget::rule::horizontal(1)
+    ]
+    .spacing(5)
+    .boxed()
+}
+pub(super) fn key_value(
+    label: impl Into<String>,
+    value: impl Into<String>,
+) -> Element<'static, Message> {
+    row![
+        text(label.into()).size(12).style(muted).width(130),
+        text(value.into()).size(14).width(Length::Fill)
+    ]
+    .spacing(12)
+    .align_y(Alignment::Start)
+    .boxed()
+}
+pub(super) fn notice(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    tone: Tone,
+) -> Element<'static, Message> {
+    container(iced::widget::column![badge(title, tone), text(detail.into()).size(13)].spacing(8))
+        .padding(12)
+        .width(Length::Fill)
+        .style(move |theme: &Theme| tone.surface(theme))
+        .boxed()
+}
+pub(super) fn capability(cap: &Capability) -> Element<'static, Message> {
+    let tone = capability_tone(&cap.status);
+    container(
+        iced::widget::column![
+            row![
+                text(cap.source.clone())
+                    .font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    })
+                    .size(13),
+                space::horizontal(),
+                badge(cap.status.clone(), tone)
+            ]
+            .spacing(10),
+            text(cap.detail.clone()).size(12)
+        ]
+        .spacing(6),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(move |theme: &Theme| tone.surface(theme))
+    .boxed()
+}
+pub(super) fn metric(label: &'static str, count: usize, tone: Tone) -> Element<'static, Message> {
+    container(
+        iced::widget::column![
+            text(count.to_string()).size(28).font(Font {
+                weight: font::Weight::Bold,
+                ..Font::DEFAULT
+            }),
+            text(label).size(12)
+        ]
+        .spacing(4),
+    )
+    .padding(14)
+    .width(Length::Fill)
+    .style(move |t: &Theme| tone.surface(t))
+    .boxed()
+}
+pub(super) fn detail_group(
+    title: &'static str,
+    fields: Vec<(&'static str, String)>,
+) -> Element<'static, Message> {
+    let mut body = iced::widget::column![
+        text(title)
+            .size(15)
+            .font(Font {
+                weight: font::Weight::Bold,
+                ..Font::DEFAULT
+            })
+            .style(text::primary)
+    ]
+    .spacing(10);
+    for (label, value) in fields {
+        body = body.push(key_value(
+            label,
+            if value.is_empty() {
+                "Unavailable / not collected".into()
+            } else {
+                value
+            },
+        ));
+    }
+    container(body)
+        .padding(14)
+        .width(Length::Fill)
+        .style(|t: &Theme| Tone::Neutral.surface(t))
+        .boxed()
+}
+/// Fill the content area settled by the modal, rather than keeping a fixed
+/// height after the user resizes the surface.
+pub(super) fn expanding_body<W>(body: iced::widget::Column<W>) -> iced::widget::Column<W> {
+    body.spacing(12).width(Length::Fill).height(Length::Fill)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::advanced::Widget;
+    #[test]
+    fn resized_body_and_remaining_content_grow_vertically() {
+        let body = expanding_body(iced::widget::column![
+            space::horizontal().height(40),
+            iced::widget::scrollable(space::horizontal().height(2000)).height(Length::Fill),
+            space::horizontal().height(20)
+        ]);
+        let mut element: iced::Element<'_, (), Theme, ()> = iced::Widget::boxed(body);
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        element.diff(&mut tree);
+        element.layout(
+            &mut tree,
+            &(),
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 400.0)),
+        );
+        assert_eq!(tree.size, iced::Size::new(900.0, 400.0));
+        let initial = tree.children[1].size.height;
+        element.layout(
+            &mut tree,
+            &(),
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(1100.0, 650.0)),
+        );
+        assert_eq!(tree.size, iced::Size::new(1100.0, 650.0));
+        assert_eq!(tree.children[1].size.height - initial, 250.0);
+        assert_eq!(tree.children[0].size.height, 40.0);
+        assert_eq!(tree.children[2].size.height, 20.0);
+        element.layout(
+            &mut tree,
+            &(),
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(760.0, 300.0)),
+        );
+        assert_eq!(tree.size, iced::Size::new(760.0, 300.0));
+        assert_eq!(tree.children[1].size.height, initial - 100.0);
+    }
+    #[test]
+    fn certainty_and_conditions_have_different_semantics() {
+        assert_eq!(
+            certainty_tone(diagnostics::Certainty::ConfirmedFailure),
+            Tone::Danger
+        );
+        assert_eq!(
+            certainty_tone(diagnostics::Certainty::Inferred),
+            Tone::Warning
+        );
+        assert_eq!(certainty_tone(diagnostics::Certainty::Observed), Tone::Info);
+        assert_ne!(
+            match_tone(easy_netstat::firewall::Match::Mismatch),
+            Tone::Danger
+        );
+        assert_ne!(
+            match_tone(easy_netstat::firewall::Match::Unknown),
+            Tone::Success
+        );
+        assert_eq!(capability_tone("Unavailable"), Tone::Warning);
+    }
+    #[test]
+    fn semantic_surfaces_adapt_to_light_and_dark_themes() {
+        for theme in [Theme::Light, Theme::Dark, Theme::Nord] {
+            let info = Tone::Info.surface(&theme);
+            let danger = Tone::Danger.surface(&theme);
+            assert_ne!(info.background, danger.background);
+            assert_ne!(info.border.color, danger.border.color);
+            for tone in [
+                Tone::Neutral,
+                Tone::Info,
+                Tone::Success,
+                Tone::Warning,
+                Tone::Danger,
+            ] {
+                let pair = tone.pair(&theme);
+                assert_ne!(pair.color, pair.text);
+            }
+        }
+        assert_ne!(
+            Tone::Warning.surface(&Theme::Light).background,
+            Tone::Warning.surface(&Theme::Dark).background
+        );
+    }
+}
