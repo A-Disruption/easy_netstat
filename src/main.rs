@@ -90,6 +90,11 @@ enum Message {
     InventoryReady(u64, Result<Arc<Inventory>, String>),
     SelectConnection(Option<ConnectionKey>),
     ToggleWorkbench,
+    DiagnosticTabChanged(workbench_ui::DiagnosticTab),
+    RuleSearchChanged(String),
+    RulePageChanged(usize),
+    RuleScopeChanged(bool),
+    RuleSelected(String),
     CloseDetails,
     Diagnose(bool),
     EvaluateCached,
@@ -138,6 +143,12 @@ struct App {
     analysis_request: u64,
     analysis_busy: bool,
     show_workbench: bool,
+    diagnostic_tab: workbench_ui::DiagnosticTab,
+    diagnostic_scroll_id: widget::Id,
+    rule_search: String,
+    rule_page: usize,
+    rule_candidates_only: bool,
+    selected_rule: Option<String>,
     sections: BTreeSet<String>,
     local_input: String,
     peer_input: String,
@@ -235,6 +246,12 @@ impl App {
                 analysis_request: 0,
                 analysis_busy: false,
                 show_workbench: false,
+                diagnostic_tab: workbench_ui::DiagnosticTab::Overview,
+                diagnostic_scroll_id: widget::Id::unique(),
+                rule_search: String::new(),
+                rule_page: 0,
+                rule_candidates_only: false,
+                selected_rule: None,
                 sections: BTreeSet::new(),
                 local_input: String::new(),
                 peer_input: String::new(),
@@ -317,6 +334,7 @@ impl App {
         match message {
             Message::Settings => {
                 self.show_settings = !self.show_settings;
+                self.show_workbench = false;
                 self.autocomplete_suggestions.clear();
                 self.autocomplete_selected_index = None;
             }
@@ -393,6 +411,11 @@ impl App {
             }
             other @ (Message::SelectConnection(_)
             | Message::ToggleWorkbench
+            | Message::DiagnosticTabChanged(_)
+            | Message::RuleSearchChanged(_)
+            | Message::RulePageChanged(_)
+            | Message::RuleScopeChanged(_)
+            | Message::RuleSelected(_)
             | Message::CloseDetails
             | Message::Diagnose(_)
             | Message::EvaluateCached
@@ -629,12 +652,7 @@ impl App {
                 text(self.inventory_status()).size(12),
                 text(&self.status).size(12),
                 text(self.filter_error.as_deref().unwrap_or("")).size(12),
-                row![
-                    container(process).width(Length::Fill).height(Length::Fill),
-                    self.workbench_pane()
-                ]
-                .spacing(8)
-                .height(Length::Fill)
+                container(process).width(Length::Fill).height(Length::Fill)
             ]
             .width(Length::Fill)
             .height(Length::Fill)
@@ -643,7 +661,7 @@ impl App {
 
         // A `Stack`, not a `Column`: the layer reports a zero size, and a column
         // with spacing would still budget a gap for it.
-        let content = stack![page, self.settings()];
+        let content = stack![page, self.settings(), self.workbench_modal()];
 
         // Until `install_latest` resolves there is no window to decorate. In
         // practice that is the first frame only.

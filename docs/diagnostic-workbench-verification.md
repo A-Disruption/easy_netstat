@@ -26,3 +26,16 @@ Process enrichment revalidated native creation identity despite CIM timestamp ro
 The [consolidated testing guide](diagnostic-workbench-testing.md) covers the final manual pass. Rendered GUI interaction, actual IFC8/enterprise application behavior, privileged/GPO/MDM policy combinations, real corresponding 5152/5157 block attribution, service restart/crash scenarios, all target Windows versions and an eight-hour production-like soak have not been certified by the automated checks. The 10,000-row construction test is not a p95 GUI latency benchmark.
 
 Optional capture/subscription collectors, audit-setting mutation/recovery and external AI are deliberately not enabled or implemented; see [implementation scope](diagnostic-workbench-implementation.md). Native Win32 calls may complete after cancellation; their results are discarded and they do not execute on the UI thread.
+
+## Diagnostics popup revision — 2026-11-09
+
+Diagnostics now uses the same themed modal component as Settings. The table remains full width; selection is separate from opening Diagnostics. Tabs expose Overview, Firewall rules, Process / services, Network, Events, History, and Tools / reports. The firewall tab shows profiles/default policies, explicit collection gaps, a searchable paged list of all collected rules, a candidate-only scope and full selected-rule predicates/provenance independently of completed scenario analysis.
+
+Verification for this revision:
+
+- **73 tests passed**, 0 failed, 0 ignored: 50 library, 21 application/filter/UI, 2 Windows integration tests.
+- Six new tests cover popup/settings exclusivity and dismissal/cancellation, selection without forced popup opening, raw rules visible before analysis, multi-field search, paging/tab construction with partial/missing data, and unavailable predicates distinguished from Any.
+- Strict Clippy, package formatting, diff whitespace checks and the locked offline release build passed.
+- The rendered-window check through the computer-use skill could not launch the application because app approval timed out. No visual layout verification is claimed; the automated tests exercise state transitions and widget construction, not rendered geometry.
+
+The release executable remains `target/release/easy_netstat.exe`. Firewall collection and diagnostic certainty rules were not changed by this UI revision.

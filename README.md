@@ -2,19 +2,20 @@
 
 A searchable TCP/UDP IPv4/IPv6 connection table with optional, read-only diagnostics. The table remains the primary interface. Automatic refresh starts paused; enable it in Settings (five seconds initially, configurable from 1–3600 seconds). Manual refresh works while paused.
 
-Select a row and open **Diagnose** for process/service context, effective Windows Firewall candidate rules, adapter/profile/routes, existing WFP Security events, and explainable findings. Expensive collection and evaluation run in background jobs. Nothing enables auditing, changes rules, starts/stops services, or changes network configuration.
+Select a row and click **Diagnostics** to open a settings-style popup with tabs for Overview, Firewall rules, Process / services, Network, Events, History, and Tools / reports. The connection table keeps its full width; selecting a row does not force the popup open. Expensive collection and evaluation run in background jobs. Nothing enables auditing, changes rules, starts/stops services, or changes network configuration.
 
 ## Using diagnostics
 
-1. Select a connection; review its process path and creation identity.
+1. Select a connection and click **Diagnostics**. Review its process path and creation identity in **Process / services**.
 2. For a listener, replace the wildcard local address with the actual local IP:port and supply a peer IP:port when known. Set the examined direction; it is an assumption, not inferred from port numbers. IPv6 endpoints use `[address%scope]:port`.
 3. Enter an interface alias or let a unique concrete local address identify it. Optional service/port inputs describe your expectations; an assumed service is not proof of socket ownership.
-4. Click **Diagnose**. The owned PowerShell collection has a 90-second deadline and Cancel action. Native OS calls, including subsequent filter metadata lookups, may finish later; late/cancelled results are discarded and never block the UI. Firewall configuration is cached for 60 seconds; **Refresh policy** bypasses that cache. Changing scenario inputs clears findings; **Evaluate cached evidence** reruns analysis without querying Windows.
-5. Expand condition details, collection capabilities, WFP filter evidence, history, or report preview as needed. Save named views or capture a baseline for comparison.
+4. Click **Collect diagnostics**. The owned PowerShell collection has a 90-second deadline and Cancel action. Native OS calls, including subsequent filter metadata lookups, may finish later; late/cancelled results are discarded and never block the UI. Firewall configuration is cached for 60 seconds; **Refresh policy** in Firewall rules bypasses that cache. Changing scenario inputs clears findings; **Evaluate collected evidence** in Overview reruns analysis without querying Windows.
+5. Open **Firewall rules** to browse/search all collected rules, even before a scenario can be evaluated. Switch to **Examined candidates** for analyzed rules. Select a rule to see its program, service restriction, protocol, local/remote ports and addresses, profiles, interfaces, policy source, enforcement and condition results. Profiles/default policies and collection gaps appear directly above the browser.
+6. Use the other tabs for services, interfaces/DNS/routes, recorded WFP events/filter metadata and history. Saved views, snapshots, DNS lookup and report preview/export are in **Tools / reports**. Close the popup with its title-bar close button, Escape or the backdrop.
 
 **Observed** means a returned OS fact. **Inferred** means a conclusion with assumptions and limitations. **Confirmed Failure** requires a matching recorded WFP failure plus revalidated process lifetime and tuple/direction. A missing allow candidate never confirms a block. A matching program rule remains valid for analysis when its executable runs as a service; service restrictions are checked separately.
 
-Standard users can use inventory. Individual firewall filter/audit/event/process queries can require additional permissions; readable categories remain available when others fail. Inspect **Collection capabilities** for the actual result. No records, denied access and incomplete collection are distinct.
+Standard users can use inventory. Individual firewall filter/audit/event/process queries can require additional permissions; readable categories remain available when others fail. Source availability is shown within each relevant tab. No records, denied access and incomplete collection are distinct; missing rule predicates are labeled **Unavailable / not collected**, never assumed to be Any.
 
 ## Filtering
 
