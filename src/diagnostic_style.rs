@@ -64,6 +64,15 @@ pub(super) fn capability_tone(status: &str) -> Tone {
         _ => Tone::Neutral,
     }
 }
+pub(super) fn firewall_enabled_status(enabled: &str) -> (&'static str, Tone) {
+    if enabled.trim().eq_ignore_ascii_case("True") {
+        ("Enabled", Tone::Success)
+    } else if enabled.trim().eq_ignore_ascii_case("False") {
+        ("Disabled", Tone::Danger)
+    } else {
+        ("Enabled state unavailable", Tone::Warning)
+    }
+}
 pub(super) fn muted(theme: &Theme) -> text::Style {
     let p = theme.palette().background.base;
     text::Style {
@@ -293,6 +302,20 @@ mod tests {
             Tone::Success
         );
         assert_eq!(capability_tone("Unavailable"), Tone::Warning);
+    }
+    #[test]
+    fn firewall_enabled_state_distinguishes_disabled_and_unknown() {
+        assert_eq!(firewall_enabled_status("True"), ("Enabled", Tone::Success));
+        assert_eq!(
+            firewall_enabled_status(" false "),
+            ("Disabled", Tone::Danger)
+        );
+        for value in ["", "NotConfigured", "Unknown"] {
+            assert_eq!(
+                firewall_enabled_status(value),
+                ("Enabled state unavailable", Tone::Warning)
+            );
+        }
     }
     #[test]
     fn semantic_surfaces_adapt_to_light_and_dark_themes() {

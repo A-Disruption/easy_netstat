@@ -57,3 +57,12 @@ The release executable is `target/release/easy_netstat.exe`. All work remains on
 The shared diagnostic scroll area now uses Iced's embedded scrollbar layout (`spacing(8)`) instead of its default floating rail. When content overflows, layout reserves the default 10-pixel rail plus an 8-pixel gap; otherwise content gets the full width. This applies to every diagnostic tab without changing the popup's scroll identity or vertical expansion.
 
 **77 tests passed** (50 library, 25 application/UI, 2 Windows integration), with no failures or ignored tests. The new headless layout regression checks the content's right edge at narrow/wide widths and across scrollbar appearance, disappearance and reappearance. The existing vertical-resize regression now also uses this shared scroll-area builder. Strict Clippy, formatting, whitespace checks and the locked offline release build passed. Rendered-window inspection remains part of the final user acceptance pass.
+
+
+## Firewall profile pills — 2026-11-09
+
+Firewall profile cards now show independent activity and enabled-state pills. An Active pill uses collected Up interfaces and lists their aliases/indexes; multiple profiles may be active. DomainAuthenticated is normalized to Domain. Disconnected interfaces do not make a profile active. When network coverage or an interface status/category is unknown, an unobserved profile shows Activity unavailable rather than asserting inactivity. Active is endpoint interface context, not attribution to the selected traffic or a claim that firewall enforcement is enabled.
+
+Enabled is green, Disabled is red, and unreadable/NotConfigured enabled values are amber. These are configuration labels, not new confirmed-failure findings. The existing collectors and firewall settings are unchanged.
+
+**79 tests passed** (50 library, 27 application/UI, 2 Windows integration), with no failures or ignored tests. New tests cover True/False/unknown enabled states, multiple active profiles, DomainAuthenticated naming, disconnected adapters, partial/missing network coverage and unknown status/category. Strict Clippy, formatting, whitespace checks and locked offline release build passed. Rendered appearance still requires user acceptance review.

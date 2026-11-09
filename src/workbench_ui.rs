@@ -1,7 +1,7 @@
 use super::*;
 use crate::diagnostic_style::{
     Tone, badge, capability, certainty_tone, detail_group, diagnostic_scroll, expanding_body,
-    key_value, match_tone, metric, muted, notice, section,
+    firewall_enabled_status, key_value, match_tone, metric, muted, notice, section,
 };
 use easy_netstat::model::Direction as TrafficDirection;
 use std::path::PathBuf;
@@ -932,21 +932,34 @@ impl App {
         }
         content = content.push(section(
             "Profile defaults",
-            "Profile settings are configuration evidence; interface profiles are shown in Network.",
+            "Active means assigned to a collected Up interface, independently of whether its firewall is enabled. Multiple profiles can be active; this is collected endpoint context, not a traffic verdict.",
         ));
         for p in &data.policy.profiles {
+            let (enabled_label, enabled_tone) = firewall_enabled_status(&p.enabled);
+            let (activity_label, activity_tone, interfaces) = profile_activity(&p.name, data);
+            let profile_header = row![
+                text(format!("{} profile", p.name)).size(16).font(Font {
+                    weight: font::Weight::Bold,
+                    ..Font::DEFAULT
+                }),
+                space::horizontal(),
+                badge(activity_label, activity_tone),
+                badge(enabled_label, enabled_tone)
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center);
             content = content.push(
                 container(
                     iced::widget::column![
-                        row![
-                            text(format!("{} profile", p.name)).size(16).font(Font {
-                                weight: font::Weight::Bold,
-                                ..Font::DEFAULT
-                            }),
-                            space::horizontal(),
-                            badge(format!("Enabled: {}", p.enabled), Tone::Info)
-                        ]
-                        .spacing(10),
+                        profile_header,
+                        key_value(
+                            "Active interfaces",
+                            if interfaces.is_empty() {
+                                "None observed / see activity status".into()
+                            } else {
+                                interfaces.join(", ")
+                            }
+                        ),
                         key_value("Default inbound", p.inbound.clone()),
                         key_value("Default outbound", p.outbound.clone()),
                         key_value("Inbound rules", p.allow_inbound_rules.clone()),
@@ -1479,6 +1492,55 @@ fn input<'a>(
     .width(Length::Fill)
     .boxed()
 }
+/// Activity is interface context, not whether firewall enforcement is enabled.
+fn profile_activity(name: &str, data: &DiagnosticData) -> (&'static str, Tone, Vec<String>) {
+    fn normalized(name: &str) -> Option<&'static str> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "domain" | "domainauthenticated" => Some("Domain"),
+            "private" => Some("Private"),
+            "public" => Some("Public"),
+            _ => None,
+        }
+    }
+    let target = normalized(name);
+    let up: Vec<_> = data
+        .interfaces
+        .iter()
+        .filter(|i| i.status.eq_ignore_ascii_case("Up"))
+        .collect();
+    let mut interfaces: Vec<_> = up
+        .iter()
+        .filter(|i| target.is_some() && normalized(&i.profile) == target)
+        .map(|i| format!("{} (#{})", i.alias, i.index))
+        .collect();
+    interfaces.sort();
+    interfaces.dedup();
+    if !interfaces.is_empty() {
+        ("Active", Tone::Info, interfaces)
+    } else if target.is_some()
+        && data
+            .capabilities
+            .iter()
+            .any(|c| c.source == "Network" && c.status == "Available")
+        && data.interfaces.iter().all(|i| {
+            matches!(
+                i.status.to_ascii_lowercase().as_str(),
+                "up" | "down"
+                    | "disconnected"
+                    | "disabled"
+                    | "not present"
+                    | "notpresent"
+                    | "lowerlayerdown"
+            )
+        })
+        && up.iter().all(|i| normalized(&i.profile).is_some())
+    {
+        ("Not active", Tone::Neutral, interfaces)
+    } else {
+        ("Activity unavailable", Tone::Warning, interfaces)
+    }
+}
+
 fn values(values: &[String]) -> String {
     if values.is_empty() {
         "Unavailable / not collected".into()
@@ -1665,6 +1727,57 @@ mod tests {
             let _ = app.workbench_modal();
         }
     }
+    #[test]
+    fn profile_activity_handles_multiple_profiles_disconnected_and_missing_data() {
+        use easy_netstat::model::Interface;
+        let mut data = DiagnosticData::default();
+        assert_eq!(profile_activity("Domain", &data).0, "Activity unavailable");
+        data.capabilities.push(Capability {
+            source: "Network".into(),
+            status: "Available".into(),
+            detail: String::new(),
+        });
+        data.interfaces = vec![
+            Interface {
+                alias: "Ethernet".into(),
+                index: 1,
+                status: "Up".into(),
+                profile: "DomainAuthenticated".into(),
+                ..Interface::default()
+            },
+            Interface {
+                alias: "Wi-Fi".into(),
+                index: 2,
+                status: "Up".into(),
+                profile: "Public".into(),
+                ..Interface::default()
+            },
+            Interface {
+                alias: "VPN".into(),
+                index: 3,
+                status: "Disconnected".into(),
+                profile: "Private".into(),
+                ..Interface::default()
+            },
+        ];
+        assert_eq!(
+            profile_activity("domain", &data),
+            ("Active", Tone::Info, vec!["Ethernet (#1)".into()])
+        );
+        assert_eq!(profile_activity("Public", &data).0, "Active");
+        assert_eq!(profile_activity("Private", &data).0, "Not active");
+        data.capabilities[0].status = "Partial".into();
+        assert_eq!(profile_activity("Private", &data).0, "Activity unavailable");
+        assert_eq!(profile_activity("Domain", &data).0, "Active");
+        data.capabilities[0].status = "Available".into();
+        data.interfaces[1].profile.clear();
+        assert_eq!(profile_activity("Public", &data).0, "Activity unavailable");
+        assert_eq!(profile_activity("Unknown", &data).0, "Activity unavailable");
+        data.interfaces[1].profile = "Public".into();
+        data.interfaces[1].status = "Unknown".into();
+        assert_eq!(profile_activity("Public", &data).0, "Activity unavailable");
+    }
+
     #[test]
     fn missing_rule_filters_are_not_presented_as_any() {
         assert_eq!(values(&[]), "Unavailable / not collected");
