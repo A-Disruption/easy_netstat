@@ -19,6 +19,12 @@ pub struct Condition {
     pub name: String,
     pub result: Match,
     pub detail: String,
+    /// What the rule requires, as collected (empty for older saved analyses).
+    #[serde(default)]
+    pub rule_value: String,
+    /// The examined traffic's value for this condition; empty when not applicable.
+    #[serde(default)]
+    pub traffic: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Relevance {
@@ -221,13 +227,20 @@ pub fn address_match(pattern: &str, address: Option<IpAddr>) -> Match {
 
 pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
     let mut conditions = Vec::new();
-    let mut add = |name: &str, result: Match, detail: String| {
+    let mut add = |name: &str, result: Match, rule_value: String, traffic: String| {
         conditions.push(Condition {
             name: name.into(),
             result,
-            detail,
+            detail: if traffic.is_empty() {
+                rule_value.clone()
+            } else {
+                format!("{rule_value}; examined {traffic}")
+            },
+            rule_value,
+            traffic,
         })
     };
+    let or_unknown = |v: Option<&str>, unknown: &str| v.unwrap_or(unknown).to_string();
     add(
         "Enabled",
         if rule.enabled {
@@ -235,7 +248,8 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
         } else {
             Match::Mismatch
         },
-        rule.enabled.to_string(),
+        if rule.enabled { "Yes" } else { "No" }.into(),
+        String::new(),
     );
     add(
         "Direction",
@@ -244,25 +258,20 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
         } else {
             eq(&rule.direction, &scenario.direction.to_string())
         },
-        format!("{}; examined {}", rule.direction, scenario.direction),
+        rule.direction.clone(),
+        scenario.direction.to_string(),
     );
     add(
         "Program",
         program(&rule.program, scenario.program.as_deref()),
-        format!(
-            "{}; examined {}",
-            rule.program.join(", "),
-            scenario.program.as_deref().unwrap_or("unavailable")
-        ),
+        rule.program.join(", "),
+        or_unknown(scenario.program.as_deref(), "unavailable"),
     );
     add(
         "Service",
         list(&rule.service, scenario.service.as_deref()),
-        format!(
-            "{}; socket service {}",
-            rule.service.join(", "),
-            scenario.service.as_deref().unwrap_or("unverified")
-        ),
+        rule.service.join(", "),
+        or_unknown(scenario.service.as_deref(), "unverified"),
     );
     add(
         "Protocol",
@@ -282,6 +291,7 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
             }
         })),
         rule.protocol.join(", "),
+        scenario.protocol.to_string(),
     );
     add(
         "Local port",
@@ -289,11 +299,8 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
             .local_ports
             .iter()
             .map(|p| port_match(p, Some(scenario.local.port())))),
-        format!(
-            "{}; examined {}",
-            rule.local_ports.join(", "),
-            scenario.local.port()
-        ),
+        rule.local_ports.join(", "),
+        scenario.local.port().to_string(),
     );
     add(
         "Remote port",
@@ -302,6 +309,10 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
             .iter()
             .map(|p| port_match(p, scenario.remote.map(|a| a.port())))),
         rule.remote_ports.join(", "),
+        scenario
+            .remote
+            .map(|a| a.port().to_string())
+            .unwrap_or_else(|| "unknown peer".into()),
     );
     add(
         "Local address",
@@ -309,11 +320,8 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
             .local_addresses
             .iter()
             .map(|a| address_match(a, Some(scenario.local.ip())))),
-        format!(
-            "{}; examined {}",
-            rule.local_addresses.join(", "),
-            scenario.local.ip()
-        ),
+        rule.local_addresses.join(", "),
+        scenario.local.ip().to_string(),
     );
     add(
         "Remote address",
@@ -321,33 +329,29 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
             .remote_addresses
             .iter()
             .map(|a| address_match(a, scenario.remote.map(|r| r.ip())))),
-        format!(
-            "{}; examined {}",
-            rule.remote_addresses.join(", "),
-            scenario
-                .remote
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "unknown peer".into())
-        ),
+        rule.remote_addresses.join(", "),
+        scenario
+            .remote
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "unknown peer".into()),
     );
     add(
         "Profile",
         list(&rule.profiles, scenario.profile.as_deref()),
-        format!(
-            "{}; examined {}",
-            rule.profiles.join(", "),
-            scenario.profile.as_deref().unwrap_or("unknown")
-        ),
+        rule.profiles.join(", "),
+        or_unknown(scenario.profile.as_deref(), "unknown"),
     );
     add(
         "Interface",
         list(&rule.interfaces, scenario.interface.as_deref()),
         rule.interfaces.join(", "),
+        or_unknown(scenario.interface.as_deref(), "unknown"),
     );
     add(
         "Interface type",
         list(&rule.interface_types, scenario.interface_type.as_deref()),
         rule.interface_types.join(", "),
+        or_unknown(scenario.interface_type.as_deref(), "unknown"),
     );
     add(
         "Coverage",
@@ -363,6 +367,15 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
         },
         if !rule.complete {
             "Associated filters incomplete".into()
+        } else if rule.unsupported.is_empty() {
+            format!(
+                "No advanced conditions; enforcement {}",
+                if rule.enforcement.is_empty() {
+                    "not reported"
+                } else {
+                    &rule.enforcement
+                }
+            )
         } else {
             format!(
                 "{}; enforcement status {}",
@@ -370,6 +383,7 @@ pub fn evaluate(rule: &FirewallRule, scenario: &Scenario) -> Evaluation {
                 rule.enforcement
             )
         },
+        String::new(),
     );
     let result = all(conditions.iter().map(|c| c.result));
     let condition = |name: &str| conditions.iter().find(|c| c.name == name).unwrap().result;

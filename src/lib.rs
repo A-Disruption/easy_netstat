@@ -8,4 +8,5 @@ pub mod inventory;
 pub mod model;
 pub mod state;
 pub mod storage;
+pub mod verdict;
 pub mod wfp;

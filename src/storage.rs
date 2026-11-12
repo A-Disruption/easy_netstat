@@ -380,6 +380,7 @@ mod tests {
                 time_ms: 1,
             }],
             rules: vec![],
+            verdict: None,
         };
         let mut d = DiagnosticData::default();
         d.events.push(RawEvent {

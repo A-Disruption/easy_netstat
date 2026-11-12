@@ -5,6 +5,8 @@ use crate::{
     model::*,
 };
 use serde::{Deserialize, Serialize};
+pub use crate::verdict::{Outcome, ProfileVerdict, Step, StepStatus, Verdict};
+use crate::verdict::{candidate_profiles, verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Certainty {
@@ -37,6 +39,8 @@ pub struct Analysis {
     pub evaluator_version: u32,
     pub findings: Vec<Finding>,
     pub rules: Vec<Evaluation>,
+    #[serde(default)]
+    pub verdict: Option<Verdict>,
 }
 
 pub fn analyze(
@@ -47,7 +51,7 @@ pub fn analyze(
     expected_port: Option<u16>,
 ) -> Analysis {
     let mut result = Analysis {
-        evaluator_version: 2,
+        evaluator_version: 3,
         ..Analysis::default()
     };
     let mut add = |id: &str,
@@ -145,13 +149,16 @@ pub fn analyze(
         }
     }
 
+    let (mut blocks_seen, mut permits_seen) = (0usize, 0usize);
+    let mut confirmed_block = false;
+    let mut confirmed_permit = false;
     for raw in &data.events {
         let Ok(event) = evidence::network_event(raw) else {
             continue;
         };
-        if !evidence::matches_scenario(&event, s) {
+        let Some(peer) = evidence::scenario_peer(&event, s) else {
             continue;
-        }
+        };
         let lifetime = c.key.process.created.is_some_and(|created| {
             event.time_ms >= filetime_ms(created) + u64::from(created % 10_000 != 0)
                 && event.time_ms <= data.finished_ms
@@ -165,16 +172,26 @@ pub fn analyze(
         let strong =
             identity_matches && lifetime && event.pid == Some(c.key.process.pid) && !path_conflict;
         if [5152, 5157].contains(&event.event_id) {
+            blocks_seen += 1;
+            if blocks_seen > 20 {
+                continue;
+            }
             if strong {
-                add("wfp.block",Certainty::ConfirmedFailure,if event.event_id==5152{"WFP dropped a matching packet".into()}else{"WFP blocked a matching connection attempt".into()},format!("Event {}, time {} ms UTC, filter {:?}, layer {}. This confirms this recorded attempt only; friendly-rule causation and business-transaction failure are not established.",event.event_id,event.time_ms,event.filter_id,event.layer),vec![event.reference],vec!["Event tuple/direction and revalidated process lifetime match; historical policy may differ.".into()],"Inspect the filter/provider and contemporaneous application evidence before attributing a root cause.");
+                confirmed_block = true;
+                add("wfp.block",Certainty::ConfirmedFailure,if event.event_id==5152{format!("WFP dropped a matching packet from {peer}")}else{format!("WFP blocked a matching connection attempt with {peer}")},format!("Event {}, time {} ms UTC, peer {peer}, filter {:?}, layer {}. This confirms this recorded attempt only; friendly-rule causation and business-transaction failure are not established.",event.event_id,event.time_ms,event.filter_id,event.layer),vec![event.reference],vec!["Event tuple/direction and revalidated process lifetime match; historical policy may differ.".into()],"Inspect the filter/provider and contemporaneous application evidence before attributing a root cause.");
             } else {
-                add("wfp.unattributed",Certainty::Observed,"A recorded block matches the examined tuple".into(),"Process identity/lifetime could not be confirmed for the selected observation. This is not a confirmed failure of the selected process.".into(),vec![event.reference],vec![],"Reproduce with process identity available or inspect historical process evidence.");
+                add("wfp.unattributed",Certainty::Observed,format!("A recorded block matches the examined tuple (peer {peer})"),"Process identity/lifetime could not be confirmed for the selected observation. This is not a confirmed failure of the selected process.".into(),vec![event.reference],vec![],"Reproduce with process identity available or inspect historical process evidence.");
             }
         } else if event.event_id == 5156 && strong {
+            confirmed_permit = true;
+            permits_seen += 1;
+            if permits_seen > 5 {
+                continue;
+            }
             add(
                 "wfp.permit",
                 Certainty::Observed,
-                "WFP recorded a permit for this attempt".into(),
+                format!("WFP recorded a permit for an attempt with {peer}"),
                 "A permit at this event point does not prove delivery or application success."
                     .into(),
                 vec![event.reference],
@@ -234,6 +251,14 @@ pub fn analyze(
         "ActiveStore:{}:{}",
         data.policy.version, data.policy.collected_ms
     );
+    let profiles = candidate_profiles(s, data);
+    let mut effective = s.clone();
+    if effective.profile.is_none()
+        && let [only] = profiles.as_slice()
+    {
+        effective.profile = Some(only.clone());
+    }
+    let s = &effective;
     result.rules = data
         .policy
         .rules
@@ -327,10 +352,24 @@ pub fn analyze(
     result.findings.push(Finding {
         id: "policy.summary".into(), certainty: if data.policy.collected_ms == 0 { Certainty::Observed } else { Certainty::Inferred }, title: title.into(),
         explanation: format!("{} matching allow candidate(s), {} matching block candidate(s), {} incomplete candidate(s), {} identity-linked near match(es). {} Policy coverage {}. Unrelated rules are excluded from the shortlist. Configuration cannot confirm a block or guarantee passage.", allows, matching_blocks, unknown, near, if names.is_empty() { String::new() } else { format!("Matching rules: {}. ", names) }, if policy_coverage { "collected supported subset" } else { "partial/unavailable/capped" }),
-        evidence: vec![policy_ref], assumptions: vec![format!("Scenario {}. Unknown conditions, service hardening, IPsec and other providers may affect the outcome.", if s.hypothetical { "contains supplied or assumed values" } else { "is observed" })],
+        evidence: vec![policy_ref.clone()], assumptions: vec![format!("Scenario {}. Unknown conditions, service hardening, IPsec and other providers may affect the outcome.", if s.hypothetical { "contains supplied or assumed values" } else { "is observed" })],
         follow_up: "Review the Relevant rules shortlist and each inclusion reason. Supply a concrete peer/local interface and inspect corresponding WFP events for an observed traffic verdict.".into(), time_ms: data.finished_ms,
     });
 
+    if data.policy.collected_ms > 0 {
+        let verdict = verdict(s, data, &profiles, &result.rules, confirmed_block, confirmed_permit);
+        result.findings.push(Finding {
+            id: "policy.verdict".into(),
+            certainty: if verdict.confirmed { Certainty::Observed } else { Certainty::Inferred },
+            title: verdict.headline.clone(),
+            explanation: verdict.reason.clone(),
+            evidence: vec![policy_ref.clone()],
+            assumptions: verdict.assumptions.clone(),
+            follow_up: verdict.next.clone(),
+            time_ms: data.finished_ms,
+        });
+        result.verdict = Some(verdict);
+    }
     result.findings.sort_by_key(|f| {
         (
             match f.certainty {
@@ -338,7 +377,11 @@ pub fn analyze(
                 Certainty::Inferred => 1,
                 Certainty::Observed => 2,
             },
-            if f.id == "policy.summary" { 0 } else { 1 },
+            match f.id.as_str() {
+                "policy.verdict" => 0,
+                "policy.summary" => 1,
+                _ => 2,
+            },
         )
     });
     result.findings.truncate(100);
@@ -448,6 +491,57 @@ mod tests {
                 .iter()
                 .any(|f| f.certainty == Certainty::ConfirmedFailure)
         );
+    }
+    #[test]
+    fn listener_without_peer_is_confirmed_by_documented_event_layout() {
+        let created = 116_444_736_000_000_000;
+        let c = crate::state::connection(42, Some(created), "Listen");
+        let mut s = crate::firewall::scenario();
+        s.local = "0.0.0.0:5001".parse().unwrap();
+        s.remote = None;
+        let mut d = data();
+        d.process = Some(ProcessContext {
+            pid: 42,
+            created: Some(created),
+            ..ProcessContext::default()
+        });
+        // 5157 as documented: inbound Source is the local endpoint.
+        d.events.push(RawEvent{channel:"Security".into(),provider:"Microsoft-Windows-Security-Auditing".into(),record_id:1,event_id:5157,time_ms:5000,xml:r#"<E><Data Name="ProcessID">42</Data><Data Name="Direction">%%14592</Data><Data Name="Protocol">6</Data><Data Name="SourceAddress">10.20.0.10</Data><Data Name="SourcePort">5001</Data><Data Name="DestAddress">10.30.0.25</Data><Data Name="DestPort">53000</Data></E>"#.into()});
+        let a = analyze(&c, &s, &d, "", None);
+        let block = a
+            .findings
+            .iter()
+            .find(|f| f.certainty == Certainty::ConfirmedFailure)
+            .expect("confirmed block");
+        assert!(block.title.contains("10.30.0.25:53000"));
+        let v = a.verdict.expect("verdict");
+        assert_eq!((v.outcome, v.confirmed), (Outcome::Blocked, true));
+    }
+    #[test]
+    fn verdict_uses_profile_default_and_single_active_profile() {
+        let c = crate::state::connection(42, Some(1), "Listen");
+        let mut s = crate::firewall::scenario();
+        s.profile = None;
+        s.remote = Some("10.30.0.25:53000".parse().unwrap());
+        let mut d = data();
+        d.policy.profiles = vec![FirewallProfile {
+            name: "Domain".into(),
+            enabled: "True".into(),
+            inbound: "Block".into(),
+            outbound: "Allow".into(),
+            allow_inbound_rules: "True".into(),
+            allow_local_rules: "True".into(),
+        }];
+        d.interfaces = vec![Interface {
+            profile: "Domain".into(),
+            status: "Up".into(),
+            ..Interface::default()
+        }];
+        let a = analyze(&c, &s, &d, "", None);
+        let v = a.verdict.as_ref().unwrap();
+        assert_eq!(v.outcome, Outcome::BlockedByDefault);
+        assert_eq!(v.closest_rule.as_deref(), Some("rule-1"));
+        assert_eq!(a.findings[0].id, "policy.verdict");
     }
     #[test]
     fn deterministic_replay() {

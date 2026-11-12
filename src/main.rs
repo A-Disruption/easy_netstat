@@ -34,6 +34,7 @@ use widgets::popover::{self, popover};
 mod diagnostic_style;
 mod filter;
 mod icon;
+mod reach_ui;
 mod workbench_ui;
 
 /// How often an automatic refresh runs, before the user changes it.
@@ -102,6 +103,11 @@ enum Message {
     RuleSelected(String),
     InspectFirewallRule(String),
     CloseDetails,
+    TogglePanel,
+    OpenFullReport,
+    ShowRuleDetail(Option<String>),
+    OpenRuleInBrowser(String),
+    CopyText(String),
     Diagnose(bool),
     EvaluateCached,
     AnalysisReady(u64, ConnectionKey, Result<Arc<Analysis>, String>),
@@ -149,6 +155,12 @@ struct App {
     analysis_request: u64,
     analysis_busy: bool,
     show_workbench: bool,
+    /// Docked reachability panel beside the table.
+    show_panel: bool,
+    /// Rule shown in the rule-vs-traffic drill-down.
+    rule_detail: Option<String>,
+    /// Latest verdict per connection checked this session: (outcome, confirmed).
+    reach: std::collections::HashMap<ConnectionKey, (diagnostics::Outcome, bool)>,
     elevation_status: Result<bool, String>,
     elevation_busy: bool,
     diagnostic_tab: workbench_ui::DiagnosticTab,
@@ -162,6 +174,8 @@ struct App {
     peer_input: String,
     direction: easy_netstat::model::Direction,
     direction_confirmed: bool,
+    /// The direction came from the socket state, not the user.
+    direction_guessed: bool,
     interface_input: String,
     expected_service: String,
     expected_port: String,
@@ -255,6 +269,9 @@ impl App {
                 analysis_request: 0,
                 analysis_busy: false,
                 show_workbench: false,
+                show_panel: true,
+                rule_detail: None,
+                reach: std::collections::HashMap::new(),
                 elevation_status: easy_netstat::elevation::is_elevated(),
                 elevation_busy: false,
                 diagnostic_tab: workbench_ui::DiagnosticTab::Overview,
@@ -268,6 +285,7 @@ impl App {
                 peer_input: String::new(),
                 direction: easy_netstat::model::Direction::Inbound,
                 direction_confirmed: false,
+                direction_guessed: false,
                 interface_input: String::new(),
                 expected_service: String::new(),
                 expected_port: String::new(),
@@ -432,6 +450,11 @@ impl App {
             | Message::RuleSelected(_)
             | Message::InspectFirewallRule(_)
             | Message::CloseDetails
+            | Message::TogglePanel
+            | Message::OpenFullReport
+            | Message::ShowRuleDetail(_)
+            | Message::OpenRuleInBrowser(_)
+            | Message::CopyText(_)
             | Message::Diagnose(_)
             | Message::EvaluateCached
             | Message::AnalysisReady(..)
@@ -582,6 +605,7 @@ impl App {
                         .align(alignment::Horizontal::Right)
                         .sortable(),
                     leaf(bold("Process")).fill(2).sortable(),
+                    leaf(bold("Reach")).fixed(130.0),
                 ])
                 .rows(rows, |socket, column| match column {
                     0 => text(&socket.protocol).boxed(),
@@ -589,7 +613,8 @@ impl App {
                     2 => text(&socket.local_addr).boxed(),
                     3 => text(&socket.remote_addr).boxed(),
                     4 => text(&socket.pid).boxed(),
-                    _ => text(&socket.process_name).boxed(),
+                    5 => text(&socket.process_name).boxed(),
+                    _ => self.reach_cell(socket.key.as_ref()),
                 })
                 .selection(
                     advanced_table::SelectionMode::Single,
@@ -667,7 +692,19 @@ impl App {
                 text(self.inventory_status()).size(12),
                 text(&self.status).size(12),
                 text(self.filter_error.as_deref().unwrap_or("")).size(12),
-                container(process).width(Length::Fill).height(Length::Fill)
+                if self.show_panel {
+                    row![
+                        container(process).width(Length::Fill).height(Length::Fill),
+                        self.reach_panel()
+                    ]
+                    .spacing(10)
+                    .boxed()
+                } else {
+                    container(process)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .boxed()
+                }
             ]
             .width(Length::Fill)
             .height(Length::Fill)
@@ -676,7 +713,12 @@ impl App {
 
         // A `Stack`, not a `Column`: the layer reports a zero size, and a column
         // with spacing would still budget a gap for it.
-        let content = stack![page, self.settings(), self.workbench_modal()];
+        let content = stack![
+            page,
+            self.settings(),
+            self.workbench_modal(),
+            self.rule_detail_modal()
+        ];
 
         // Until `install_latest` resolves there is no window to decorate. In
         // practice that is the first frame only.

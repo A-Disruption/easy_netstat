@@ -1,6 +1,9 @@
 use crate::model::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkEvent {
@@ -142,20 +145,54 @@ pub fn network_event(raw: &RawEvent) -> Result<NetworkEvent, String> {
     })
 }
 
-/// Exact tuple/direction matching is necessary even when an application path
-/// looks familiar. Listener wildcard addresses are not concrete packet IPs.
-pub fn matches_scenario(e: &NetworkEvent, s: &Scenario) -> bool {
-    let Some(remote) = s.remote else {
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_canonical(),
+        v4 => v4,
+    }
+}
+
+/// The scenario's local endpoint may be a listener wildcard (`0.0.0.0` / `::`),
+/// which accepts any concrete local address of a compatible family. A `::`
+/// listener can be dual-stack, so it also accepts IPv4 (and mapped) addresses.
+fn local_matches(spec: SocketAddr, actual: SocketAddr) -> bool {
+    if spec.port() != actual.port() {
         return false;
-    };
-    let (source, destination) = match s.direction {
-        Direction::Inbound => (remote, s.local),
-        Direction::Outbound => (s.local, remote),
-    };
-    e.direction == Some(s.direction)
-        && e.protocol == Some(s.protocol)
-        && e.source == Some(source)
-        && e.destination == Some(destination)
+    }
+    match spec.ip() {
+        IpAddr::V4(a) if a.is_unspecified() => canonical(actual.ip()).is_ipv4(),
+        IpAddr::V6(a) if a.is_unspecified() => true,
+        ip => canonical(ip) == canonical(actual.ip()),
+    }
+}
+
+/// With no peer supplied, any remote endpoint qualifies; the event's own
+/// remote address is then reported, not assumed.
+fn remote_matches(spec: Option<SocketAddr>, actual: SocketAddr) -> bool {
+    spec.is_none_or(|r| r.port() == actual.port() && canonical(r.ip()) == canonical(actual.ip()))
+}
+
+/// The remote endpoint of `e` when its tuple matches the scenario, else None.
+///
+/// Direction and protocol must match exactly. Source/destination orientation is
+/// NOT trusted: Microsoft documents inbound 5157/5152 Source as the local side,
+/// words 5156 the other way, and its own samples disagree with both. The local
+/// side is therefore identified by the scenario's local endpoint, in either slot.
+pub fn scenario_peer(e: &NetworkEvent, s: &Scenario) -> Option<SocketAddr> {
+    if e.direction != Some(s.direction) || e.protocol != Some(s.protocol) {
+        return None;
+    }
+    let (a, b) = (e.source?, e.destination?);
+    [(a, b), (b, a)]
+        .into_iter()
+        .find(|&(local, remote)| local_matches(s.local, local) && remote_matches(s.remote, remote))
+        .map(|(_, remote)| remote)
+}
+
+/// Exact tuple/direction matching is necessary even when an application path
+/// looks familiar. A wildcard listener matches its port on any local address.
+pub fn matches_scenario(e: &NetworkEvent, s: &Scenario) -> bool {
+    scenario_peer(e, s).is_some()
 }
 
 #[cfg(test)]
@@ -181,8 +218,44 @@ mod tests {
         s.direction = Direction::Inbound;
         s.protocol = Protocol::Udp;
         assert!(!matches_scenario(&e, &s));
+        s.protocol = Protocol::Tcp;
+        s.remote = Some("10.20.0.26:53000".parse().unwrap());
+        assert!(!matches_scenario(&e, &s));
+        s.local = "10.20.0.10:5002".parse().unwrap();
         s.remote = None;
         assert!(!matches_scenario(&e, &s));
+    }
+    #[test]
+    fn listener_without_peer_matches_and_reports_event_peer() {
+        let e = network_event(&event()).unwrap();
+        let mut s = crate::firewall::scenario();
+        s.remote = None;
+        s.local = "0.0.0.0:5001".parse().unwrap();
+        assert_eq!(scenario_peer(&e, &s), Some("10.20.0.25:53000".parse().unwrap()));
+        s.local = "[::]:5001".parse().unwrap();
+        assert!(matches_scenario(&e, &s));
+        s.local = "[::1]:5001".parse().unwrap();
+        assert!(!matches_scenario(&e, &s));
+    }
+    #[test]
+    fn either_source_destination_orientation_matches() {
+        // Documented 5157 layout: inbound Source is the local endpoint.
+        let mut raw = event();
+        raw.xml = raw
+            .xml
+            .replace("10.20.0.25</Data><Data Name=\"SourcePort\">53000", "10.20.0.10</Data><Data Name=\"SourcePort\">5001")
+            .replace("10.20.0.10</Data><Data Name=\"DestPort\">5001", "10.20.0.25</Data><Data Name=\"DestPort\">53000");
+        let e = network_event(&raw).unwrap();
+        assert_eq!(e.source, Some("10.20.0.10:5001".parse().unwrap()));
+        let s = crate::firewall::scenario();
+        assert_eq!(scenario_peer(&e, &s), s.remote);
+    }
+    #[test]
+    fn mapped_ipv6_peer_matches_ipv4_scenario() {
+        let mut raw = event();
+        raw.xml = raw.xml.replace(">10.20.0.25<", ">::ffff:10.20.0.25<");
+        let e = network_event(&raw).unwrap();
+        assert!(matches_scenario(&e, &crate::firewall::scenario()));
     }
     #[test]
     fn unknown_fields_do_not_invent_endpoints() {

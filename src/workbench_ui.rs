@@ -97,7 +97,7 @@ impl App {
             }
         )
     }
-    fn scenario(&self) -> Result<Scenario, String> {
+    pub(super) fn scenario(&self) -> Result<Scenario, String> {
         let c = self.selected.as_ref().ok_or("Select a connection")?;
         if !self.direction_confirmed {
             return Err("Choose Inbound or Outbound in Overview before evaluating firewall policy. A connection row does not establish traffic direction.".into());
@@ -143,7 +143,7 @@ impl App {
         }
         Ok(s)
     }
-    fn evaluate(&mut self) -> Task<Message> {
+    pub(super) fn evaluate(&mut self) -> Task<Message> {
         if self.analysis_busy {
             self.status = "Analysis is still running; evaluate again when it finishes.".into();
             return Task::none();
@@ -218,9 +218,17 @@ impl App {
                 if let Some(cancel) = &self.diagnostic_cancel {
                     cancel.store(true, Ordering::Relaxed);
                 }
-                self.direction_confirmed = false;
                 self.selected =
                     key.and_then(|k| self.history.current.iter().find(|c| c.key == k).cloned());
+                self.rule_detail = None;
+                match self.selected.as_ref().map(|c| self.guess_direction(c)) {
+                    Some(direction) => {
+                        self.direction = direction;
+                        self.direction_confirmed = true;
+                        self.direction_guessed = true;
+                    }
+                    None => self.direction_confirmed = false,
+                }
                 self.diagnostic_data = None;
                 self.analysis = Analysis::default();
                 self.analysis_request += 1;
@@ -301,6 +309,26 @@ impl App {
                     .update_workbench(Message::DiagnosticTabChanged(DiagnosticTab::Firewall));
             }
 
+            Message::TogglePanel => {
+                self.show_panel = !self.show_panel;
+                self.autocomplete_suggestions.clear();
+                self.autocomplete_selected_index = None;
+            }
+            Message::OpenFullReport => {
+                self.show_workbench = true;
+                self.show_settings = false;
+            }
+            Message::ShowRuleDetail(id) => self.rule_detail = id,
+            Message::OpenRuleInBrowser(id) => {
+                self.rule_detail = None;
+                self.show_workbench = true;
+                self.show_settings = false;
+                return self.update_workbench(Message::InspectFirewallRule(id));
+            }
+            Message::CopyText(value) => {
+                self.status = "Copied to the clipboard.".into();
+                return iced::clipboard::write(value).discard();
+            }
             Message::CloseDetails => {
                 self.show_workbench = false;
                 if let Some(c) = &self.diagnostic_cancel {
@@ -365,16 +393,22 @@ impl App {
             Message::EvaluateCached => return self.evaluate(),
             Message::AnalysisReady(id, key, result) => {
                 self.analysis_busy = false;
-                if id == self.analysis_request
-                    && self.selected.as_ref().map(|c| &c.key) == Some(&key)
-                {
+                let current = self.selected.as_ref().map(|c| &c.key) == Some(&key);
+                if id == self.analysis_request && current {
                     match result {
                         Ok(a) => {
                             self.analysis = Arc::unwrap_or_clone(a);
+                            if let Some(v) = &self.analysis.verdict {
+                                self.reach.insert(key.clone(), (v.outcome, v.confirmed));
+                            }
                             self.status="Analysis complete. Scenario/service inputs are assumptions; configuration does not confirm traffic failure.".into();
                         }
                         Err(e) => self.status = e,
                     }
+                } else if current && self.diagnostic_data.is_some() {
+                    // Inputs changed (or new data arrived) while this ran, and
+                    // evaluate() refused to start a second one meanwhile.
+                    return self.evaluate();
                 }
             }
             Message::ScenarioChanged(field, value) => {
@@ -389,6 +423,7 @@ impl App {
                         return Task::none();
                     }
                     "direction" => {
+                        self.direction_guessed = false;
                         self.direction_confirmed = matches!(value.as_str(), "Inbound" | "Outbound");
                         self.direction = if value == "Outbound" {
                             TrafficDirection::Outbound
@@ -401,6 +436,9 @@ impl App {
                 self.analysis = Analysis::default();
                 self.analysis_request += 1;
                 self.status = "Inputs changed. Evaluate cached evidence or run Diagnose.".into();
+                if self.diagnostic_data.is_some() {
+                    return self.evaluate();
+                }
             }
             Message::ToggleSection(section) => {
                 if !self.sections.remove(&section) {
@@ -631,7 +669,15 @@ impl App {
     }
     pub(super) fn toolbar(&self) -> Element<'_, Message> {
         row![
-            button("Diagnostics").on_press(Message::ToggleWorkbench),
+            button(if self.show_panel {
+                "Hide reachability"
+            } else {
+                "Reachability"
+            })
+            .on_press(Message::TogglePanel),
+            button("Full report")
+                .style(button::secondary)
+                .on_press(Message::ToggleWorkbench),
             text(
                 self.selected
                     .as_ref()
@@ -1834,6 +1880,105 @@ mod tests {
             ..DiagnosticData::default()
         }));
         app
+    }
+    fn conn(local: &str, remote: Option<&str>, state: &str) -> Connection {
+        let mut c = fixture().selected.clone().unwrap();
+        c.key.local = local.parse().unwrap();
+        c.key.remote = remote.map(|r| r.parse().unwrap());
+        c.state = state.into();
+        c
+    }
+    #[test]
+    fn direction_is_guessed_from_socket_state_and_cleared_by_user_choice() {
+        let mut app = fixture();
+        assert_eq!(
+            app.guess_direction(&conn("0.0.0.0:5001", None, "Listen")),
+            TrafficDirection::Inbound
+        );
+        // Accepted connection on a port the same process listens on.
+        assert_eq!(
+            app.guess_direction(&conn("10.20.0.10:5001", Some("10.30.0.25:53000"), "Established")),
+            TrafficDirection::Inbound
+        );
+        assert_eq!(
+            app.guess_direction(&conn("10.20.0.10:49702", Some("10.20.0.5:1433"), "Established")),
+            TrafficDirection::Outbound
+        );
+        let outbound = conn("10.20.0.10:49702", Some("10.20.0.5:1433"), "Established");
+        app.history.current.push(outbound.clone());
+        let _ = app.update(Message::SelectConnection(Some(outbound.key)));
+        assert!(app.direction_confirmed && app.direction_guessed);
+        assert_eq!(app.direction, TrafficDirection::Outbound);
+        assert_eq!(app.peer_input, "10.20.0.5:1433");
+        let _ = app.update(Message::ScenarioChanged("direction".into(), "Inbound".into()));
+        assert!(!app.direction_guessed);
+    }
+    #[test]
+    fn inputs_change_re_evaluates_cached_evidence() {
+        let mut app = fixture();
+        let _ = app.update(Message::ScenarioChanged("peer".into(), "10.30.0.25:53000".into()));
+        assert!(app.analysis_busy, "cached data should be re-evaluated");
+        // A result for the superseded request is dropped and evaluation re-runs.
+        let request = app.analysis_request;
+        let key = app.selected.as_ref().unwrap().key.clone();
+        let _ = app.update(Message::ScenarioChanged("peer".into(), "10.30.0.26:53000".into()));
+        let _ = app.update(Message::AnalysisReady(
+            request,
+            key,
+            Ok(Arc::new(Analysis::default())),
+        ));
+        assert!(app.analysis_busy);
+        assert_eq!(app.analysis_request, request + 2);
+    }
+    #[test]
+    fn verdict_fills_reach_column_and_panel_and_rule_detail_build() {
+        let mut app = fixture();
+        let key = app.selected.as_ref().unwrap().key.clone();
+        let s = app.scenario().unwrap();
+        let analysis = diagnostics::analyze(
+            app.selected.as_ref().unwrap(),
+            &s,
+            app.diagnostic_data.as_ref().unwrap(),
+            "",
+            None,
+        );
+        assert!(analysis.verdict.is_some());
+        app.analysis_request += 1;
+        app.analysis_busy = true;
+        let _ = app.update(Message::AnalysisReady(
+            app.analysis_request,
+            key.clone(),
+            Ok(Arc::new(analysis)),
+        ));
+        assert!(app.reach.contains_key(&key));
+        let _ = app.reach_cell(Some(&key));
+        let _ = app.reach_panel();
+        let _ = app.update(Message::ShowRuleDetail(Some("id-0".into())));
+        assert_eq!(app.rule_detail.as_deref(), Some("id-0"));
+        let _ = app.rule_detail_modal();
+        let _ = app.update(Message::OpenRuleInBrowser("id-0".into()));
+        assert!(app.rule_detail.is_none() && app.show_workbench);
+        assert_eq!(app.selected_rule.as_deref(), Some("id-0"));
+        let _ = app.update(Message::TogglePanel);
+        assert!(!app.show_panel);
+        let _ = app.view();
+    }
+    #[test]
+    fn widen_command_targets_the_single_excluding_condition() {
+        let mut app = fixture();
+        app.peer_input = "10.30.0.25:53000".into();
+        let rule = app.diagnostic_data.as_ref().unwrap().policy.rules[0].clone();
+        let mut e = easy_netstat::firewall::evaluate(&rule, &app.scenario().unwrap());
+        // Make Remote address the only exclusion.
+        for c in &mut e.conditions {
+            if c.name != "Remote address" && c.result == easy_netstat::firewall::Match::Mismatch {
+                c.result = easy_netstat::firewall::Match::Match;
+            }
+        }
+        assert_eq!(
+            app.widen_command(&rule, &e).as_deref(),
+            Some("Set-NetFirewallRule -Name 'id-0' -RemoteAddress 10.20.0.0/24,10.30.0.25")
+        );
     }
     #[test]
     fn popup_and_settings_are_exclusive_and_dismissible() {
