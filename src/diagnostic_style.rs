@@ -21,23 +21,46 @@ impl Tone {
             Self::Danger => p.danger.weak,
         }
     }
-    pub(super) fn surface(self, theme: &Theme) -> container::Style {
-        let pair = self.pair(theme);
+    fn accent(self, theme: &Theme) -> iced::Color {
         let p = theme.palette();
-        let accent = match self {
+        match self {
             Self::Neutral => p.background.strong.color,
             Self::Info => p.primary.base.color,
             Self::Success => p.success.base.color,
             Self::Warning => p.warning.base.color,
             Self::Danger => p.danger.base.color,
-        };
+        }
+    }
+    /// A card: the darkest background, barely tinted toward the tone, with a
+    /// thin tone-colored border. Large areas stay calm; color marks state.
+    pub(super) fn surface(self, theme: &Theme) -> container::Style {
+        let p = theme.palette();
+        let accent = self.accent(theme);
+        let tint = if self == Self::Neutral { 0.0 } else { 0.10 };
+        container::Style {
+            background: Some(p.background.base.color.mix(accent, tint).into()),
+            text_color: Some(p.background.base.text),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: if self == Self::Neutral {
+                    p.background.strong.color
+                } else {
+                    accent.scale_alpha(0.7)
+                },
+            },
+            ..container::Style::default()
+        }
+    }
+    /// A small solid label. The only place a tone fills its whole box.
+    pub(super) fn pill(self, theme: &Theme) -> container::Style {
+        let pair = self.pair(theme);
         container::Style {
             background: Some(pair.color.into()),
             text_color: Some(pair.text),
             border: iced::Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: accent,
+                radius: 999.0.into(),
+                ..iced::Border::default()
             },
             ..container::Style::default()
         }
@@ -73,6 +96,17 @@ pub(super) fn firewall_enabled_status(enabled: &str) -> (&'static str, Tone) {
         ("Enabled state unavailable", Tone::Warning)
     }
 }
+/// "just now", "12 s ago", "5 min ago", "2 h ago", "3 d ago".
+pub(super) fn ago(ms: u64) -> String {
+    let s = now_ms().saturating_sub(ms) / 1000;
+    match s {
+        0..=4 => "just now".into(),
+        5..=59 => format!("{s} s ago"),
+        60..=3599 => format!("{} min ago", s / 60),
+        3600..=86399 => format!("{} h ago", s / 3600),
+        _ => format!("{} d ago", s / 86400),
+    }
+}
 pub(super) fn muted(theme: &Theme) -> text::Style {
     let p = theme.palette().background.base;
     text::Style {
@@ -85,8 +119,8 @@ pub(super) fn badge(label: impl Into<String>, tone: Tone) -> Element<'static, Me
         weight: font::Weight::Bold,
         ..Font::DEFAULT
     }))
-    .padding([4, 8])
-    .style(move |theme: &Theme| tone.surface(theme))
+    .padding([3, 10])
+    .style(move |theme: &Theme| tone.pill(theme))
     .boxed()
 }
 pub(super) fn section(
@@ -130,8 +164,32 @@ pub(super) fn notice(
         .style(move |theme: &Theme| tone.surface(theme))
         .boxed()
 }
+/// `auditpol /r` CSV rows -> "Subcategory: setting" lines.
+fn readable_audit(detail: &str) -> String {
+    let lines: Vec<_> = detail
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<_> = l.split(',').collect();
+            (f.len() > 4 && !f[2].is_empty()).then(|| format!("{}: {}", f[2], f[4]))
+        })
+        .collect();
+    if lines.is_empty() {
+        detail.to_string()
+    } else {
+        lines.join(
+            "
+",
+        )
+    }
+}
 pub(super) fn capability(cap: &Capability) -> Element<'static, Message> {
     let tone = capability_tone(&cap.status);
+    let detail = if cap.source == "Audit policy" {
+        readable_audit(&cap.detail)
+    } else {
+        cap.detail.clone()
+    };
     container(
         iced::widget::column![
             row![
@@ -145,29 +203,13 @@ pub(super) fn capability(cap: &Capability) -> Element<'static, Message> {
                 badge(cap.status.clone(), tone)
             ]
             .spacing(10),
-            text(cap.detail.clone()).size(12)
+            text(detail).size(12).style(muted)
         ]
         .spacing(6),
     )
     .padding(10)
     .width(Length::Fill)
-    .style(move |theme: &Theme| tone.surface(theme))
-    .boxed()
-}
-pub(super) fn metric(label: &'static str, count: usize, tone: Tone) -> Element<'static, Message> {
-    container(
-        iced::widget::column![
-            text(count.to_string()).size(28).font(Font {
-                weight: font::Weight::Bold,
-                ..Font::DEFAULT
-            }),
-            text(label).size(12)
-        ]
-        .spacing(4),
-    )
-    .padding(14)
-    .width(Length::Fill)
-    .style(move |t: &Theme| tone.surface(t))
+    .style(|theme: &Theme| Tone::Neutral.surface(theme))
     .boxed()
 }
 pub(super) fn detail_group(
@@ -339,5 +381,20 @@ mod tests {
             Tone::Warning.surface(&Theme::Light).background,
             Tone::Warning.surface(&Theme::Dark).background
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    #[test]
+    fn audit_csv_becomes_readable_lines() {
+        let csv = "Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting
+PC,System,Filtering Platform Packet Drop,{0CCE9225},No Auditing,
+";
+        assert_eq!(
+            super::readable_audit(csv),
+            "Filtering Platform Packet Drop: No Auditing"
+        );
+        assert_eq!(super::readable_audit("Access denied"), "Access denied");
     }
 }

@@ -249,14 +249,22 @@ pub fn profile_verdict(profile: &str, s: &Scenario, data: &DiagnosticData) -> Pr
         steps.push(
             "Block rules",
             StepStatus::Fail,
-            format!("{} matching block rule(s): {}", blocks.len(), names(&blocks)),
+            format!(
+                "{} matching block rule(s): {}",
+                blocks.len(),
+                names(&blocks)
+            ),
         );
         steps.push(
             "Allow rules",
             StepStatus::Skipped,
             "Block rules take precedence over allow rules.",
         );
-        steps.push("Default action", StepStatus::Skipped, "A rule decided this traffic.");
+        steps.push(
+            "Default action",
+            StepStatus::Skipped,
+            "A rule decided this traffic.",
+        );
         return finish(
             Outcome::Blocked,
             format!(
@@ -284,9 +292,15 @@ pub fn profile_verdict(profile: &str, s: &Scenario, data: &DiagnosticData) -> Pr
         steps.push(
             "Allow rules",
             StepStatus::Fail,
-            format!("The {profile} profile blocks all incoming connections, including allowed apps."),
+            format!(
+                "The {profile} profile blocks all incoming connections, including allowed apps."
+            ),
         );
-        steps.push("Default action", StepStatus::Skipped, "Allow rules are not applied.");
+        steps.push(
+            "Default action",
+            StepStatus::Skipped,
+            "Allow rules are not applied.",
+        );
         return finish(
             Outcome::Blocked,
             format!(
@@ -300,9 +314,17 @@ pub fn profile_verdict(profile: &str, s: &Scenario, data: &DiagnosticData) -> Pr
         steps.push(
             "Allow rules",
             StepStatus::Pass,
-            format!("{} matching allow rule(s): {}", allows.len(), names(&allows)),
+            format!(
+                "{} matching allow rule(s): {}",
+                allows.len(),
+                names(&allows)
+            ),
         );
-        steps.push("Default action", StepStatus::Skipped, "A rule decided this traffic.");
+        steps.push(
+            "Default action",
+            StepStatus::Skipped,
+            "A rule decided this traffic.",
+        );
         return if maybe_blocks.is_empty() {
             finish(
                 Outcome::Allowed,
@@ -408,13 +430,43 @@ pub fn profile_verdict(profile: &str, s: &Scenario, data: &DiagnosticData) -> Pr
             );
             finish(
                 Outcome::Uncertain,
-                format!(
-                    "No rule decides this and the {profile} default action couldn't be read."
-                ),
+                format!("No rule decides this and the {profile} default action couldn't be read."),
                 None,
                 steps,
             )
         }
+    }
+}
+
+/// Fix agreement after several profile names replace one ("Private and
+/// Public profile blocks" -> "Private and Public profiles block").
+fn plural(text: &str, joined: &str) -> String {
+    let mut out = text.replace(
+        &format!("{joined} profile "),
+        &format!("{joined} profiles "),
+    );
+    for (one, many) in [
+        ("profiles blocks", "profiles block"),
+        ("profiles allows", "profiles allow"),
+        ("profiles is ", "profiles are "),
+    ] {
+        out = out.replace(one, many);
+    }
+    for verb in ["blocks", "allows"] {
+        out = out.replace(
+            &format!("{joined} {verb}"),
+            &format!("{joined} {}", &verb[..verb.len() - 1]),
+        );
+    }
+    out
+}
+/// "Private", "Private and Public", "Domain, Private and Public".
+pub fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let names: Vec<_> = names.collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -517,15 +569,34 @@ pub fn verdict(
             "Firewall profile settings unavailable".to_string(),
             "No firewall profile settings were collected.".to_string(),
         ),
-        Some(first) if profiles.iter().all(|p| p.outcome == first.outcome) => (
-            first.outcome,
-            headline_for(first, s),
-            profiles
+        Some(first) if profiles.iter().all(|p| p.outcome == first.outcome) => {
+            // Profiles that reach the same result for the same reason are said
+            // once, naming them together ("Private and Public").
+            let same_reason = profiles
                 .iter()
-                .map(|p| p.reason.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
+                .all(|p| p.reason.replace(&p.profile, &first.profile) == first.reason);
+            if same_reason && profiles.len() > 1 {
+                let joined = join_names(profiles.iter().map(|p| p.profile.as_str()));
+                (
+                    first.outcome,
+                    plural(
+                        &headline_for(first, s).replace(&first.profile, &joined),
+                        &joined,
+                    ),
+                    plural(&first.reason.replace(&first.profile, &joined), &joined),
+                )
+            } else {
+                (
+                    first.outcome,
+                    headline_for(first, s),
+                    profiles
+                        .iter()
+                        .map(|p| p.reason.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
         Some(_) => (
             Outcome::Uncertain,
             "Can't tell: the result depends on which firewall profile applies".to_string(),
@@ -627,18 +698,21 @@ mod tests {
 
     #[test]
     fn no_allow_and_default_block_is_blocked_by_default() {
-        let d = data(vec![rule()], vec![profile("Domain", "True", "Block", "True")]);
+        let d = data(
+            vec![rule()],
+            vec![profile("Domain", "True", "Block", "True")],
+        );
         let v = verdict(&outside_peer(), &d, &["Domain".into()], &[], false, false);
         assert_eq!(v.outcome, Outcome::BlockedByDefault);
         assert!(!v.confirmed);
-        assert_eq!(
-            v.profiles[0].steps.last().unwrap().status,
-            StepStatus::Fail
-        );
+        assert_eq!(v.profiles[0].steps.last().unwrap().status, StepStatus::Fail);
     }
     #[test]
     fn matching_allow_is_allowed() {
-        let d = data(vec![rule()], vec![profile("Domain", "True", "Block", "True")]);
+        let d = data(
+            vec![rule()],
+            vec![profile("Domain", "True", "Block", "True")],
+        );
         assert_eq!(outcome(&d, &scenario()), Outcome::Allowed);
     }
     #[test]
@@ -650,7 +724,10 @@ mod tests {
     }
     #[test]
     fn block_all_incoming_overrides_matching_allow() {
-        let d = data(vec![rule()], vec![profile("Domain", "True", "Block", "False")]);
+        let d = data(
+            vec![rule()],
+            vec![profile("Domain", "True", "Block", "False")],
+        );
         assert_eq!(outcome(&d, &scenario()), Outcome::Blocked);
         let mut s = scenario();
         s.direction = Direction::Outbound;
@@ -662,7 +739,10 @@ mod tests {
         let mut b = rule();
         b.id = "block".into();
         b.action = "Block".into();
-        let d = data(vec![rule(), b], vec![profile("Domain", "True", "Block", "True")]);
+        let d = data(
+            vec![rule(), b],
+            vec![profile("Domain", "True", "Block", "True")],
+        );
         let v = verdict(&scenario(), &d, &["Domain".into()], &[], false, false);
         assert_eq!(v.outcome, Outcome::Blocked);
         assert_eq!(v.profiles[0].deciding_rule.as_deref(), Some("block"));
@@ -710,8 +790,37 @@ mod tests {
         assert_eq!(outcome(&d, &s), Outcome::Uncertain);
     }
     #[test]
+    fn agreeing_profiles_are_described_once() {
+        let mut d = data(
+            vec![],
+            vec![
+                profile("Private", "True", "Block", "True"),
+                profile("Public", "True", "Block", "True"),
+            ],
+        );
+        d.interfaces = ["Private", "Public"]
+            .map(|p| Interface {
+                profile: p.into(),
+                status: "Up".into(),
+                ..Interface::default()
+            })
+            .to_vec();
+        let mut s = scenario();
+        s.profile = None;
+        let v = verdict(&s, &d, &candidate_profiles(&s, &d), &[], false, false);
+        assert_eq!(v.outcome, Outcome::BlockedByDefault);
+        assert_eq!(
+            v.reason,
+            "No allow rule matches, and the Private and Public profiles block inbound traffic by default."
+        );
+        assert!(v.headline.contains("Private and Public"));
+    }
+    #[test]
     fn recorded_events_override_configuration() {
-        let d = data(vec![rule()], vec![profile("Domain", "True", "Block", "True")]);
+        let d = data(
+            vec![rule()],
+            vec![profile("Domain", "True", "Block", "True")],
+        );
         let v = verdict(&scenario(), &d, &["Domain".into()], &[], true, false);
         assert_eq!((v.outcome, v.confirmed), (Outcome::Blocked, true));
         let v = verdict(&scenario(), &d, &["Domain".into()], &[], true, true);
@@ -721,7 +830,12 @@ mod tests {
     fn not_configured_uses_windows_defaults() {
         let d = data(
             vec![],
-            vec![profile("Domain", "NotConfigured", "NotConfigured", "NotConfigured")],
+            vec![profile(
+                "Domain",
+                "NotConfigured",
+                "NotConfigured",
+                "NotConfigured",
+            )],
         );
         assert_eq!(outcome(&d, &scenario()), Outcome::BlockedByDefault);
     }

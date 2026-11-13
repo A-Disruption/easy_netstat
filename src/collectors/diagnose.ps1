@@ -42,9 +42,11 @@ try {
     $profiles = @(Get-NetConnectionProfile)
     $configs = @(Get-NetIPConfiguration -All)
     $adapters = @(Get-NetAdapter -IncludeHidden)
+    $nac = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue)
     $interfaces = @($configs | Select-Object -First 256 | ForEach-Object {
         $config = $_; $adapter = $adapters | Where-Object { $_.ifIndex -eq $config.InterfaceIndex } | Select-Object -First 1
         $profile = $profiles | Where-Object { $_.InterfaceIndex -eq $config.InterfaceIndex } | Select-Object -First 1
+        $legacy = $nac | Where-Object { $_.InterfaceIndex -eq $config.InterfaceIndex } | Select-Object -First 1
         $category = [string]$profile.NetworkCategory
         if ($category -eq 'DomainAuthenticated') { $category = 'Domain' }
         $kind = ''
@@ -56,9 +58,11 @@ try {
         $errors = $null
         if ($counters) { $errors = [uint64]$counters.ReceivedPacketErrors + [uint64]$counters.OutboundPacketErrors }
         [ordered]@{ index = [uint32]$config.InterfaceIndex; alias = [string]$config.InterfaceAlias; profile = $category; kind = $kind;
-            addresses = @(@($config.IPv4Address) + @($config.IPv6Address) | Where-Object { $_ } | ForEach-Object { [string]$_.IPAddress });
+            addresses = @(@($config.IPv4Address) + @($config.IPv6Address) + @($config.IPv6TemporaryAddress) + @($config.IPv6LinkLocalAddress) | Where-Object { $_ } | ForEach-Object { [string]$_.IPAddress + '/' + [string]$_.PrefixLength });
             dns = @($config.DNSServer | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ });
             gateways = @(@($config.IPv4DefaultGateway) + @($config.IPv6DefaultGateway) | Where-Object { $_ } | ForEach-Object { [string]$_.NextHop });
+            dhcp = @(if ($legacy -and $legacy.DHCPEnabled -and $legacy.DHCPServer) { [string]$legacy.DHCPServer });
+            wins = @(@($legacy.WINSPrimaryServer, $legacy.WINSSecondaryServer) | Where-Object { $_ } | ForEach-Object { [string]$_ });
             status = [string]$adapter.Status; errors = $errors }
     })
     Status 'Network' $(if ($configs.Count -gt 256) { 'Partial' } else { 'Available' }) 'Current adapter/profile context; counters are absolute, not attributed to this flow.'
@@ -68,6 +72,13 @@ try {
     $routes = @($allRoutes | Select-Object -First 4096 | ForEach-Object { [ordered]@{ destination = [string]$_.DestinationPrefix; next_hop = [string]$_.NextHop; interface = [uint32]$_.InterfaceIndex; metric = [uint32]$_.RouteMetric } })
     Status 'Routes' $(if ($allRoutes.Count -gt 4096) { 'Partial' } else { 'Available' }) 'Current configured routes; not proof of the actual historical packet path.'
 } catch { Status 'Routes' 'Unavailable' $_.Exception.Message }
+$tcpDynamic = $null; $udpDynamic = $null
+try {
+    $t = Get-NetTCPSetting -SettingName Internet -ErrorAction Stop
+    $tcpDynamic = @([uint32]$t.DynamicPortRangeStartPort, [uint32]$t.DynamicPortRangeNumberOfPorts)
+    $u = Get-NetUDPSetting -ErrorAction Stop
+    $udpDynamic = @([uint32]$u.DynamicPortRangeStartPort, [uint32]$u.DynamicPortRangeNumberOfPorts)
+} catch { Status 'Dynamic ports' 'Unavailable' $_.Exception.Message }
 if ($request.include_policy) {
     try {
         $fp = @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
@@ -83,14 +94,12 @@ if ($request.include_policy) {
             $r = $_; $id = [string]$r.InstanceID
             $a = $app[$id]; $s = $svc[$id]; $p = $port[$id]; $d = $addr[$id]; $i = $iface[$id]; $t = $itype[$id]; $sec = $security[$id]
             $unsupported = New-Object System.Collections.Generic.List[string]
-            if ($a.Package -and [string]$a.Package -ne 'Any') { $unsupported.Add('Package restriction: ' + [string]$a.Package) }
             if ($a.PolicyAppId) { $unsupported.Add('PolicyAppId: ' + [string]$a.PolicyAppId) }
-            if ($r.EdgeTraversalPolicy -and [string]$r.EdgeTraversalPolicy -ne 'Block') { $unsupported.Add('Edge traversal: ' + [string]$r.EdgeTraversalPolicy) }
-            foreach ($field in @('Authentication','Encryption','OverrideBlockRules','LocalUser','RemoteUser','RemoteMachine')) {
+            foreach ($field in @('Authentication','Encryption','OverrideBlockRules','RemoteUser','RemoteMachine')) {
                 $v = [string]$sec.$field
                 if ($v -and $v -notin @('Any','NotRequired','False','NotConfigured')) { $unsupported.Add($field + ': ' + $v) }
             }
-            foreach ($field in @('RemoteDynamicKeywordAddresses','PolicyAppId','Owner','Platform')) {
+            foreach ($field in @('RemoteDynamicKeywordAddresses','PolicyAppId')) {
                 $v = [string]$r.$field
                 if ($v -and $v -notin @('Any','{}','0')) { $unsupported.Add($field + ': ' + $v) }
             }
@@ -104,7 +113,9 @@ if ($request.include_policy) {
                 local_addresses = @(Strings $d.LocalAddress); remote_addresses = @(Strings $d.RemoteAddress);
                 interfaces = @(Strings $i.InterfaceAlias); interface_types = @(Strings $t.InterfaceType);
                 unsupported = @($unsupported.ToArray()); complete = [bool]($a -and $s -and $p -and $d -and $i -and $t -and $sec);
-                enforcement = [string]$r.EnforcementStatus }
+                enforcement = [string]$r.EnforcementStatus; owner = [string]$r.Owner;
+                package = $(if ($a.Package -and [string]$a.Package -ne 'Any') { [string]$a.Package } else { '' });
+                local_user = $(if ($sec.LocalUser -and [string]$sec.LocalUser -ne 'Any') { [string]$sec.LocalUser } else { '' }) }
         })
         # Detect rule churn across the associated-filter reads. This is still
         # not an atomic OS policy snapshot; collection interval stays explicit.
@@ -148,4 +159,5 @@ foreach ($log in @('System','Application')) {
     }
 }
 [ordered]@{ schema = 1; started_ms = $started; finished_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();
-    process = $process; services = $services; interfaces = $interfaces; routes = $routes; policy = $policy; events = $events; capabilities = @($caps.ToArray()) } | ConvertTo-Json -Depth 12 -Compress
+    process = $process; services = $services; interfaces = $interfaces; routes = $routes; policy = $policy; events = $events; capabilities = @($caps.ToArray());
+    tcp_dynamic_ports = $tcpDynamic; udp_dynamic_ports = $udpDynamic } | ConvertTo-Json -Depth 12 -Compress

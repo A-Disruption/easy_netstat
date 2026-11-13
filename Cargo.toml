@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["rt", "sync"] }
 image = { version = "0.25", default-features = false, features = ["ico", "png"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_System_Rpc", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Com"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_System_Rpc", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_UI_Shell", "Win32_System_Registry", "Win32_System_Com"] }
 
 # Embeds the .ico into the exe's Win32 resources, which is where Windows looks
 # for the taskbar, Alt-Tab and Explorer icons.

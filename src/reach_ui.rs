@@ -2,7 +2,7 @@
 //! drill-down it opens. The full multi-tab report stays available as a modal.
 use super::*;
 use crate::diagnostic_style::{Tone, badge, diagnostic_scroll, muted, notice};
-use easy_netstat::diagnostics::{Outcome, StepStatus, Verdict};
+use easy_netstat::diagnostics::{Outcome, ProfileVerdict, StepStatus, Verdict};
 use easy_netstat::firewall::{self, Evaluation, Match, Relevance};
 use easy_netstat::model::Direction as TrafficDirection;
 
@@ -23,13 +23,63 @@ pub(super) fn outcome_tone(outcome: Outcome, confirmed: bool) -> Tone {
         None => Tone::Neutral,
     }
 }
-fn step_badge(status: StepStatus) -> Element<'static, Message> {
-    match status {
-        StepStatus::Pass => badge("Pass", Tone::Success),
-        StepStatus::Fail => badge("Fail", Tone::Warning),
-        StepStatus::Unknown => badge("Unknown", Tone::Neutral),
-        StepStatus::Skipped => badge("Skipped", Tone::Neutral),
+/// One compact decision row: colored square, step name, status word. Detail
+/// shows underneath only when the step stopped or couldn't decide the traffic.
+fn step_row(status: StepStatus, name: String, detail: String) -> Element<'static, Message> {
+    let color = move |t: &Theme| {
+        let p = t.palette();
+        match status {
+            StepStatus::Pass => p.success.base.color,
+            StepStatus::Fail => p.warning.base.color,
+            StepStatus::Unknown | StepStatus::Skipped => p.background.strong.color,
+        }
+    };
+    let word = match status {
+        StepStatus::Pass => "Pass",
+        StepStatus::Fail => "Fail",
+        StepStatus::Unknown => "Unknown",
+        StepStatus::Skipped => "Skipped",
+    };
+    let square = container(space::horizontal())
+        .width(10)
+        .height(10)
+        .style(move |t: &Theme| container::Style {
+            background: Some(color(t).into()),
+            border: iced::Border {
+                radius: 2.0.into(),
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        });
+    let label = text(word).size(12).style(move |t: &Theme| match status {
+        StepStatus::Pass | StepStatus::Fail => text::Style {
+            color: Some(color(t)),
+            ..text::Style::default()
+        },
+        _ => muted(t),
+    });
+    let line = row![square, text(name).size(13), space::horizontal(), label]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .padding([4, 0]);
+    if matches!(status, StepStatus::Fail | StepStatus::Unknown) {
+        iced::widget::column![
+            line,
+            container(text(detail).size(12).style(muted)).padding(iced::Padding {
+                left: 20.0,
+                ..iced::Padding::ZERO
+            })
+        ]
+        .boxed()
+    } else {
+        line.boxed()
     }
+}
+/// Text-only button in the theme's accent color, used like a hyperlink.
+fn link(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::text(theme, status);
+    style.text_color = theme.palette().primary.strong.color;
+    style
 }
 fn match_badge(m: Match) -> Element<'static, Message> {
     match m {
@@ -84,7 +134,7 @@ impl App {
                 },
                 outcome_tone(outcome, confirmed),
             ),
-            None => text("—").style(muted).boxed(),
+            None => text("Not checked").size(13).style(muted).boxed(),
         }
     }
 
@@ -129,12 +179,11 @@ impl App {
         (StepStatus::Unknown, detail)
     }
 
-    fn verdict_view<'a>(&'a self, v: &'a Verdict) -> Element<'a, Message> {
+    pub(super) fn verdict_view<'a>(&'a self, v: &'a Verdict) -> Element<'a, Message> {
         let tone = outcome_tone(v.outcome, v.confirmed);
         let card = container(
             iced::widget::column![
-                badge(v.outcome.label(), tone),
-                bold(&v.headline).size(16),
+                bold(v.outcome.label()).size(17),
                 text(&v.reason).size(13),
                 text(if v.confirmed {
                     "Confirmed by a recorded Windows Filtering Platform event."
@@ -144,74 +193,95 @@ impl App {
                 .size(12)
                 .style(muted),
             ]
-            .spacing(8),
+            .spacing(6),
         )
-        .padding(12)
+        .padding(14)
         .width(Length::Fill)
         .style(move |t: &Theme| tone.surface(t));
 
-        let mut steps = iced::widget::column![].spacing(10);
+        // Profiles that took identical steps are shown once, named together.
+        let key = |p: &ProfileVerdict| {
+            p.steps
+                .iter()
+                .map(|s| (s.status, s.name.clone(), s.detail.replace(&p.profile, "")))
+                .collect::<Vec<_>>()
+        };
+        let mut groups: Vec<(Vec<&ProfileVerdict>, _)> = Vec::new();
         for p in &v.profiles {
+            let k = key(p);
+            match groups
+                .iter_mut()
+                .find(|(g, gk)| g[0].outcome == p.outcome && *gk == k)
+            {
+                Some((g, _)) => g.push(p),
+                None => groups.push((vec![p], k)),
+            }
+        }
+        let mut steps = iced::widget::column![].spacing(4);
+        for (group, _) in &groups {
             if v.profiles.len() > 1 {
+                let names =
+                    easy_netstat::verdict::join_names(group.iter().map(|p| p.profile.as_str()));
                 steps = steps.push(
-                    bold(format!("{} profile · {}", p.profile, p.outcome.label())).size(13).boxed()
+                    text(format!(
+                        "{names} {} · {}",
+                        if group.len() > 1 {
+                            "profiles"
+                        } else {
+                            "profile"
+                        },
+                        group[0].outcome.label()
+                    ))
+                    .size(12)
+                    .style(muted)
+                    .boxed(),
                 );
             }
-            for s in &p.steps {
-                steps = steps.push(
-                    row![
-                        container(step_badge(s.status)).width(80),
-                        iced::widget::column![text(&s.name).size(13), text(&s.detail).size(12).style(muted)]
-                            .spacing(2)
-                            .width(Length::Fill)
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Start).boxed()
-                );
+            for s in group[0]
+                .steps
+                .iter()
+                .filter(|s| s.status != StepStatus::Skipped)
+            {
+                steps = steps.push(step_row(s.status, s.name.clone(), s.detail.clone()));
             }
         }
         let (status, detail) = self.events_step(v);
-        steps = steps.push(
-            row![
-                container(step_badge(status)).width(80),
-                iced::widget::column![
-                    text("Recorded events").size(13),
-                    text(detail).size(12).style(muted)
-                ]
-                .spacing(2)
-                .width(Length::Fill)
-            ]
-            .spacing(8).boxed()
-        );
+        steps = steps.push(step_row(status, "Recorded events".into(), detail));
 
-        let mut rules = iced::widget::column![].spacing(6);
+        let mut rules = iced::widget::column![].spacing(4);
         let deciding = v.profiles.iter().find_map(|p| p.deciding_rule.clone());
-        for (label, id) in [("Deciding rule", deciding), ("Closest rule", v.closest_rule.clone())]
-            .into_iter()
-            .filter_map(|(l, id)| id.map(|id| (l, id)))
+        for (label, id) in [
+            ("Deciding rule:", deciding),
+            ("Closest rule:", v.closest_rule.clone()),
+        ]
+        .into_iter()
+        .filter_map(|(l, id)| id.map(|id| (l, id)))
         {
+            let scope = self
+                .analysis
+                .rules
+                .iter()
+                .find(|e| e.rule_id == id)
+                .and_then(|e| e.conditions.iter().find(|c| c.result == Match::Mismatch))
+                .map(|c| format!("· {} {}", c.name.to_lowercase(), c.rule_value))
+                .unwrap_or_default();
             rules = rules.push(
-                button(text(format!("{label}: {}", self.rule_name(&id))).size(13))
-                    .style(button::secondary)
-                    .width(Length::Fill)
-                    .on_press(Message::ShowRuleDetail(Some(id))).boxed()
+                row![
+                    text(label).size(13),
+                    button(text(self.rule_name(&id)).size(13))
+                        .padding(0)
+                        .style(link)
+                        .on_press(Message::ShowRuleDetail(Some(id))),
+                    text(scope).size(13).style(muted),
+                ]
+                .spacing(6)
+                .wrap()
+                .boxed(),
             );
         }
-        iced::widget::column![
-            card,
-            steps,
-            rules,
-            iced::widget::column![
-                text("NEXT").size(11).font(Font {
-                    weight: font::Weight::Bold,
-                    ..Font::DEFAULT
-                }),
-                text(&v.next).size(13)
-            ]
-            .spacing(4)
-        ]
-        .spacing(14)
-        .boxed()
+        iced::widget::column![card, steps, rules, text(&v.next).size(12).style(muted)]
+            .spacing(14)
+            .boxed()
     }
 
     pub(super) fn reach_panel(&self) -> Element<'_, Message> {
@@ -223,29 +293,39 @@ impl App {
                 .on_press(Message::TogglePanel)
         ]
         .align_y(Alignment::Center);
-        let mut body = iced::widget::column![header].spacing(14).padding(iced::Padding {
-            right: 14.0,
-            ..iced::Padding::ZERO
-        });
+        let mut body = iced::widget::column![header]
+            .spacing(14)
+            .padding(iced::Padding {
+                right: 16.0,
+                ..iced::Padding::ZERO
+            });
         let Some(c) = &self.selected else {
-            body = body.push(notice(
-                "Nothing selected",
-                "Select a row in the table to check whether its traffic would get through the firewall.",
-                Tone::Info,
-            ).boxed());
+            body = body.push(
+                text("Select a row in the table to check whether its traffic would get through the firewall.")
+                    .size(13)
+                    .style(muted)
+                    .boxed(),
+            );
             return self.panel_frame(body);
+        };
+        let endpoint = if c.key.local.ip().is_unspecified() {
+            format!("listening on all addresses, port {}", c.key.local.port())
+        } else {
+            c.key.local.to_string()
         };
         body = body.push(
             iced::widget::column![
-                bold(&c.process.name).size(15),
+                bold(&c.process.name).size(16),
                 text(format!(
-                    "PID {} · {} {} · {}",
-                    c.key.process.pid, c.key.protocol, c.key.local, c.state
+                    "PID {} · {} · {}",
+                    c.key.process.pid, c.key.protocol, c.state
                 ))
-                .size(12)
-                .style(muted)
+                .size(13)
+                .style(muted),
+                text(endpoint).size(12).font(Font::MONOSPACE).style(muted),
             ]
-            .spacing(2).boxed()
+            .spacing(3)
+            .boxed(),
         );
         let inbound = self.direction == TrafficDirection::Inbound;
         let dir_button = |label: &'static str, dir: TrafficDirection| {
@@ -258,62 +338,64 @@ impl App {
                 })
                 .on_press(Message::ScenarioChanged("direction".into(), label.into()))
         };
+        let busy = self.diagnostic_gate.busy();
         body = body.push(
             iced::widget::column![
+                text(if inbound { "From client" } else { "To server" })
+                    .size(12)
+                    .style(muted),
+                text_input("IP:port (optional)", &self.peer_input)
+                    .on_input(|v| Message::ScenarioChanged("peer".into(), v))
+                    .font(Font::MONOSPACE)
+                    .size(13)
+                    .padding(8),
                 row![
                     dir_button("Inbound", TrafficDirection::Inbound),
                     dir_button("Outbound", TrafficDirection::Outbound)
                 ]
                 .spacing(6),
                 text(if self.direction_guessed {
-                    "Direction guessed from the socket state; change it if that's wrong."
+                    "Direction guessed from the socket state."
                 } else if inbound {
-                    "Checking traffic that arrives at this endpoint."
+                    "Traffic arriving at this endpoint."
                 } else {
-                    "Checking traffic this endpoint sends."
+                    "Traffic this endpoint sends."
                 })
                 .size(12)
                 .style(muted),
-                text(if inbound { "From client" } else { "To server" })
-                    .size(12)
-                    .style(muted),
-                text_input("IP:port (optional, IPv6 in brackets)", &self.peer_input)
-                    .on_input(|v| Message::ScenarioChanged("peer".into(), v))
-                    .padding(8),
+                row![
+                    button(if busy {
+                        "Checking…"
+                    } else if self.diagnostic_data.is_some() {
+                        "Check again"
+                    } else {
+                        "Check"
+                    })
+                    .style(button::primary)
+                    .on_press_maybe((!busy).then_some(Message::Diagnose(false))),
+                    button("Cancel")
+                        .style(button::text)
+                        .on_press_maybe(busy.then_some(Message::CancelDiagnosis)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
             ]
-            .spacing(6).boxed()
-        );
-        let busy = self.diagnostic_gate.busy();
-        body = body.push(
-            row![
-                button(if busy {
-                    "Checking…"
-                } else if self.diagnostic_data.is_some() {
-                    "Check again"
-                } else {
-                    "Check"
-                })
-                .style(button::primary)
-                .on_press_maybe((!busy).then_some(Message::Diagnose(false))),
-                button("Cancel")
-                    .style(button::text)
-                    .on_press_maybe(busy.then_some(Message::CancelDiagnosis)),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center).boxed()
+            .spacing(6)
+            .boxed(),
         );
 
         if let Some(v) = &self.analysis.verdict {
-            body = body.push(self.verdict_view(v).boxed());
+            body = body.push(self.verdict_view(v));
         } else if self.analysis_busy {
             body = body.push(text("Evaluating…").size(13).style(muted).boxed());
         } else if self.diagnostic_data.is_some() {
-            body = body.push(notice("Not evaluated", self.status.clone(), Tone::Info).boxed());
+            body = body.push(notice("Not evaluated", self.status.clone(), Tone::Info));
         } else {
             body = body.push(
                 text("Check reads firewall policy, process, network and recorded events for this endpoint. Nothing is changed.")
                     .size(13)
-                    .style(muted).boxed()
+                    .style(muted)
+                    .boxed(),
             );
         }
         if let Some(data) = &self.diagnostic_data {
@@ -327,51 +409,76 @@ impl App {
                 body = body.push(
                     text(format!("Limited data: {}.", missing.join(", ")))
                         .size(12)
-                        .style(muted).boxed()
+                        .style(muted)
+                        .boxed(),
                 );
             }
-        }
-        if !matches!(self.elevation_status, Ok(true)) {
-            body = body.push(
-                row![
-                    text("Standard user: the Security log can't be read.")
-                        .size(12)
-                        .style(muted)
-                        .width(Length::Fill),
-                    button(text(if self.elevation_busy {
-                        "Waiting…"
-                    } else {
-                        "Restart as admin"
-                    }).size(12))
-                    .style(button::text)
-                    .on_press_maybe(
-                        (!self.elevation_busy).then_some(Message::RestartAsAdministrator)
-                    )
-                ]
-                .align_y(Alignment::Center).boxed()
-            );
         }
         body = body.push(
             button(text("Open full report").align_x(alignment::Horizontal::Center))
                 .width(Length::Fill)
                 .style(button::secondary)
-                .on_press(Message::OpenFullReport).boxed()
+                .on_press(Message::OpenFullReport)
+                .boxed(),
+        );
+        if !matches!(self.elevation_status, Ok(true)) {
+            body = body.push(
+                row![
+                    text("Standard user · Security events need admin.")
+                        .size(12)
+                        .style(muted),
+                    button(
+                        text(if self.elevation_busy {
+                            "Waiting…"
+                        } else {
+                            "Restart as admin"
+                        })
+                        .size(12)
+                    )
+                    .padding(0)
+                    .style(link)
+                    .on_press_maybe(
+                        (!self.elevation_busy).then_some(Message::RestartAsAdministrator)
+                    )
+                ]
+                .spacing(6)
+                .wrap()
+                .boxed(),
+            );
+        }
+        body = body.push(
+            text("Changing the peer or direction re-checks the collected data instantly; Check again re-reads Windows.")
+                .size(12)
+                .style(muted)
+                .boxed(),
         );
         self.panel_frame(body)
     }
 
-    fn panel_frame<'a>(&'a self, body: iced::widget::Column<Element<'a, Message>>) -> Element<'a, Message> {
-        container(diagnostic_scroll(body))
-            .width(PANEL_WIDTH)
-            .height(Length::Fill)
-            .padding(iced::Padding {
-                top: 14.0,
-                bottom: 14.0,
-                left: 14.0,
-                right: 0.0,
-            })
-            .style(|t: &Theme| Tone::Neutral.surface(t))
-            .boxed()
+    /// A plain side column divided from the table by a single line, not a card.
+    fn panel_frame<'a>(
+        &'a self,
+        body: iced::widget::Column<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        row![
+            iced::widget::rule::vertical(1),
+            container(diagnostic_scroll(body))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(iced::Padding {
+                    top: 16.0,
+                    bottom: 16.0,
+                    left: 18.0,
+                    right: 2.0,
+                })
+                .style(|t: &Theme| container::Style {
+                    background: Some(t.palette().background.weak.color.into()),
+                    ..container::Style::default()
+                })
+        ]
+        .width(PANEL_WIDTH)
+        .height(Length::Fill)
+        .boxed()
     }
 
     /// The analysis's own evaluation when the rule is on its shortlist; else a
@@ -380,7 +487,10 @@ impl App {
         if let Some(e) = self.analysis.rules.iter().find(|e| e.rule_id == rule.id) {
             return Some(e.clone());
         }
-        let mut s = self.scenario().ok()?;
+        let mut s = easy_netstat::diagnostics::enrich(
+            &self.scenario().ok()?,
+            self.diagnostic_data.as_ref()?,
+        );
         if s.profile.is_none()
             && let Some(v) = &self.analysis.verdict
             && let [only] = v.profiles.as_slice()
@@ -484,16 +594,26 @@ impl App {
         .align_y(Alignment::Center);
 
         let cell = |s: &str| {
-            text(if s.is_empty() { "—".to_string() } else { s.to_string() })
-                .size(13)
-                .font(Font::MONOSPACE)
-                .width(Length::FillPortion(2))
+            text(if s.is_empty() {
+                "—".to_string()
+            } else {
+                s.to_string()
+            })
+            .size(13)
+            .font(Font::MONOSPACE)
+            .width(Length::FillPortion(2))
         };
         let mut table = iced::widget::column![
             row![
                 text("Condition").size(12).style(muted).width(130),
-                text("Rule requires").size(12).style(muted).width(Length::FillPortion(2)),
-                text("This traffic").size(12).style(muted).width(Length::FillPortion(2)),
+                text("Rule requires")
+                    .size(12)
+                    .style(muted)
+                    .width(Length::FillPortion(2)),
+                text("This traffic")
+                    .size(12)
+                    .style(muted)
+                    .width(Length::FillPortion(2)),
                 text("Result").size(12).style(muted).width(130),
             ]
             .spacing(10)
@@ -525,13 +645,17 @@ impl App {
                     .style(move |t: &Theme| match tone {
                         Some(tone) => tone.surface(t),
                         None => container::Style::default(),
-                    }).boxed()
+                    })
+                    .boxed(),
             );
         }
 
-        let mut left = iced::widget::column![header, container(table).style(|t: &Theme| Tone::Neutral.surface(t))]
-            .spacing(14)
-            .width(Length::Fill);
+        let mut left = iced::widget::column![
+            header,
+            container(table).style(|t: &Theme| Tone::Neutral.surface(t))
+        ]
+        .spacing(14)
+        .width(Length::Fill);
         if let Some(cmd) = self.widen_command(rule, &e) {
             left = left.push(
                 container(
@@ -558,7 +682,8 @@ impl App {
                 )
                 .padding(12)
                 .width(Length::Fill)
-                .style(|t: &Theme| Tone::Neutral.surface(t)).boxed()
+                .style(|t: &Theme| Tone::Neutral.surface(t))
+                .boxed(),
             );
         }
         left = left.push(
@@ -570,7 +695,8 @@ impl App {
                     .style(button::text)
                     .on_press(Message::ShowRuleDetail(None)),
             ]
-            .spacing(8).boxed()
+            .spacing(8)
+            .boxed(),
         );
 
         let candidate = |e: &Evaluation| {
@@ -590,18 +716,20 @@ impl App {
             })
             .on_press(Message::ShowRuleDetail(Some(e.rule_id.clone())))
         };
-        let mut right = iced::widget::column![
-            text("RULES THAT NAME THIS PROGRAM")
-                .size(11)
-                .style(muted)
-        ]
-        .spacing(8)
-        .width(270);
+        let mut right =
+            iced::widget::column![text("RULES THAT NAME THIS PROGRAM").size(11).style(muted)]
+                .spacing(8)
+                .width(270);
         let named: Vec<_> = self
             .analysis
             .rules
             .iter()
-            .filter(|e| matches!(e.relevance, Some(Relevance::Application | Relevance::Service)))
+            .filter(|e| {
+                matches!(
+                    e.relevance,
+                    Some(Relevance::Application | Relevance::Service)
+                )
+            })
             .take(8)
             .collect();
         if named.is_empty() {
@@ -610,11 +738,7 @@ impl App {
         for e in named {
             right = right.push(candidate(e).boxed());
         }
-        right = right.push(
-            text("BROAD RULES THAT MATCH")
-                .size(11)
-                .style(muted).boxed()
-        );
+        right = right.push(text("BROAD RULES THAT MATCH").size(11).style(muted).boxed());
         let broad: Vec<_> = self
             .analysis
             .rules

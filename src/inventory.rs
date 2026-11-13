@@ -106,6 +106,12 @@ pub fn filetime_ms(t: u64) -> u64 {
 pub fn process_identity(pid: u32) -> ProcessKey {
     native::process(pid).0
 }
+
+/// The process token's user, groups and AppContainer SIDs. Callers must
+/// bracket this with `process_identity` checks so a reused PID is rejected.
+pub fn process_token(pid: u32) -> Result<TokenIdentity, String> {
+    native::token(pid)
+}
 type Row = (SocketAddr, Option<SocketAddr>, String, u32);
 
 pub fn tcp_state(value: u32) -> String {
@@ -197,6 +203,118 @@ mod native {
             CloseHandle(handle);
         }
         (key, details)
+    }
+
+    /// Owned Win32 handle, closed on drop.
+    struct Handle(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// SID pointer -> "S-1-5-..." string.
+    unsafe fn sid_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+        use windows_sys::Win32::{
+            Foundation::LocalFree, Security::Authorization::ConvertSidToStringSidW,
+        };
+        if sid.is_null() {
+            return None;
+        }
+        let mut wide: *mut u16 = ptr::null_mut();
+        // SAFETY: sid points into a live token buffer; Windows allocates `wide`.
+        if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 || wide.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        // SAFETY: Windows returns a NUL-terminated string.
+        while unsafe { *wide.add(len) } != 0 && len < 512 {
+            len += 1;
+        }
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+        unsafe { LocalFree(wide.cast()) };
+        Some(text)
+    }
+
+    pub(super) fn token(pid: u32) -> Result<TokenIdentity, String> {
+        use windows_sys::Win32::Security::*;
+        const SE_GROUP_ENABLED: u32 = 0x4;
+        const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return Err(format!(
+                    "Process query unavailable (Windows {})",
+                    GetLastError()
+                ));
+            }
+            let process = Handle(process);
+            let mut raw = ptr::null_mut();
+            if OpenProcessToken(process.0, TOKEN_QUERY, &mut raw) == 0 {
+                return Err(format!(
+                    "Process token unavailable (Windows {})",
+                    GetLastError()
+                ));
+            }
+            let token = Handle(raw);
+            // u64 storage keeps the returned structures 8-byte aligned.
+            let info = |class: TOKEN_INFORMATION_CLASS| -> Result<Vec<u64>, String> {
+                let mut len = 0u32;
+                GetTokenInformation(token.0, class, ptr::null_mut(), 0, &mut len);
+                if len == 0 || len > 1 << 20 {
+                    return Err(format!("Token information {class} unavailable"));
+                }
+                let mut buffer = vec![0u64; (len as usize).div_ceil(8)];
+                if GetTokenInformation(token.0, class, buffer.as_mut_ptr().cast(), len, &mut len)
+                    == 0
+                {
+                    return Err(format!(
+                        "Token information {class} unavailable (Windows {})",
+                        GetLastError()
+                    ));
+                }
+                Ok(buffer)
+            };
+            let user = info(TokenUser)?;
+            let user_sid = sid_string((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid)
+                .ok_or("Token user SID unreadable")?;
+
+            let groups_buffer = info(TokenGroups)?;
+            let groups_ptr = groups_buffer.as_ptr().cast::<TOKEN_GROUPS>();
+            let count = ((*groups_ptr).GroupCount as usize).min(4096);
+            let first = ptr::addr_of!((*groups_ptr).Groups).cast::<SID_AND_ATTRIBUTES>();
+            let (mut groups, mut deny_only) = (Vec::new(), Vec::new());
+            for i in 0..count {
+                let entry = ptr::read_unaligned(first.add(i));
+                let Some(sid) = sid_string(entry.Sid) else {
+                    continue;
+                };
+                if entry.Attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 {
+                    deny_only.push(sid);
+                } else if entry.Attributes & SE_GROUP_ENABLED != 0 {
+                    groups.push(sid);
+                }
+            }
+
+            let is_container = info(TokenIsAppContainer)
+                .map(|b| *b.as_ptr().cast::<u32>() != 0)
+                .unwrap_or(false);
+            let app_container_sid = if is_container {
+                info(TokenAppContainerSid).ok().and_then(|b| {
+                    sid_string(
+                        (*b.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer,
+                    )
+                })
+            } else {
+                None
+            };
+            Ok(TokenIdentity {
+                user_sid,
+                groups,
+                deny_only,
+                app_container_sid,
+            })
+        }
     }
 
     pub(super) fn table(protocol: Protocol, ipv6: bool) -> Result<Vec<Row>, String> {
@@ -334,6 +452,9 @@ mod native {
     pub(super) fn process(pid: u32) -> (ProcessKey, ProcessDetails) {
         (ProcessKey { pid, created: None }, ProcessDetails::default())
     }
+    pub(super) fn token(_: u32) -> Result<TokenIdentity, String> {
+        Err("Windows required".into())
+    }
 }
 
 #[cfg(test)]
@@ -377,5 +498,17 @@ mod tests {
                 inventory.errors
             );
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod token_tests {
+    #[test]
+    fn own_process_token_has_user_and_groups() {
+        let t = super::process_token(std::process::id()).unwrap();
+        assert!(t.user_sid.starts_with("S-1-5-"), "{}", t.user_sid);
+        // Everyone (S-1-1-0) is in every interactive token.
+        assert!(t.groups.iter().any(|g| g == "S-1-1-0"), "{:?}", t.groups);
+        assert!(t.app_container_sid.is_none());
     }
 }

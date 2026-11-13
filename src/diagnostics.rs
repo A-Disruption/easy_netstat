@@ -1,3 +1,5 @@
+pub use crate::verdict::{Outcome, ProfileVerdict, Step, StepStatus, Verdict};
+use crate::verdict::{candidate_profiles, verdict};
 use crate::{
     evidence,
     firewall::{self, Evaluation, Match},
@@ -5,8 +7,6 @@ use crate::{
     model::*,
 };
 use serde::{Deserialize, Serialize};
-pub use crate::verdict::{Outcome, ProfileVerdict, Step, StepStatus, Verdict};
-use crate::verdict::{candidate_profiles, verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Certainty {
@@ -41,6 +41,104 @@ pub struct Analysis {
     pub rules: Vec<Evaluation>,
     #[serde(default)]
     pub verdict: Option<Verdict>,
+}
+
+/// "10.0.0.42/24" or "fe80::1%5/64" -> (address, prefix length).
+fn prefix(value: &str) -> Option<(std::net::IpAddr, u32)> {
+    let (address, length) = value.split_once('/')?;
+    let address = address.split('%').next()?.parse().ok()?;
+    Some((address, length.trim().parse().ok()?))
+}
+
+/// Fills in what rule conditions need beyond the endpoint itself, from this
+/// collection: the process token, the services it hosts, and what address
+/// and port keywords (LocalSubnet, DNS, RPC, ...) resolve to. Values the user
+/// already supplied are kept.
+pub fn enrich(s: &Scenario, data: &DiagnosticData) -> Scenario {
+    let mut e = s.clone();
+    let status = |source: &str| {
+        data.capabilities
+            .iter()
+            .find(|c| c.source == source)
+            .map(|c| c.status.as_str())
+    };
+    // `process` is only kept when its identity was revalidated (collectors).
+    let process = data.process.as_ref().filter(|p| Some(p.pid) == s.pid);
+    if e.token.is_none() {
+        e.token = process.and_then(|p| p.token.clone());
+    }
+    if e.hosted_services.is_none() && process.is_some() && status("Services") == Some("Available") {
+        e.hosted_services = Some(
+            data.services
+                .iter()
+                .filter(|v| Some(v.pid) == s.pid && v.state.eq_ignore_ascii_case("Running"))
+                .map(|v| v.name.clone())
+                .collect(),
+        );
+    }
+    if e.network.dynamic_ports.is_none() {
+        e.network.dynamic_ports = match s.protocol {
+            Protocol::Tcp => data.tcp_dynamic_ports,
+            Protocol::Udp => data.udp_dynamic_ports,
+        }
+        .filter(|[start, count]| *count > 0 && *start <= 65535)
+        .map(|[start, count]| (start as u16, (start + count - 1).min(65535) as u16));
+    }
+    if !e.network.known && status("Network") == Some("Available") {
+        let interfaces: Vec<_> = data
+            .interfaces
+            .iter()
+            .filter(|i| match &s.interface {
+                Some(alias) => i.alias.eq_ignore_ascii_case(alias),
+                None => i.status.eq_ignore_ascii_case("Up"),
+            })
+            .collect();
+        let ips = |values: &[String]| -> Vec<std::net::IpAddr> {
+            values
+                .iter()
+                .filter_map(|v| v.split(['/', '%']).next()?.trim().parse().ok())
+                .collect()
+        };
+        let net = &mut e.network;
+        net.known = true;
+        let mut push_subnet = |ip: std::net::IpAddr, len: u32| {
+            let full = if ip.is_ipv4() { 32 } else { 128 };
+            // Host routes and default routes are not subnets.
+            if len > 0 && len < full && !ip.is_multicast() {
+                let entry = format!("{ip}/{len}");
+                if !net.subnets.contains(&entry) {
+                    net.subnets.push(entry);
+                }
+            }
+        };
+        for i in &interfaces {
+            for (ip, len) in i.addresses.iter().filter_map(|a| prefix(a)) {
+                push_subnet(ip, len);
+            }
+        }
+        // Temporary IPv6 addresses are /128; their subnet is the on-link route.
+        if matches!(status("Routes"), Some("Available" | "Partial")) {
+            let indexes: Vec<_> = interfaces.iter().map(|i| i.index).collect();
+            for r in data
+                .routes
+                .iter()
+                .filter(|r| indexes.contains(&r.interface))
+            {
+                if matches!(r.next_hop.trim(), "0.0.0.0" | "::")
+                    && let Some((ip, len)) = prefix(&r.destination)
+                {
+                    push_subnet(ip, len);
+                }
+            }
+        }
+        for i in &interfaces {
+            net.dns.extend(ips(&i.dns));
+            net.gateways.extend(ips(&i.gateways));
+            net.dhcp.extend(ips(&i.dhcp));
+            net.wins.extend(ips(&i.wins));
+        }
+    }
+    e
 }
 
 pub fn analyze(
@@ -252,7 +350,7 @@ pub fn analyze(
         data.policy.version, data.policy.collected_ms
     );
     let profiles = candidate_profiles(s, data);
-    let mut effective = s.clone();
+    let mut effective = enrich(s, data);
     if effective.profile.is_none()
         && let [only] = profiles.as_slice()
     {
@@ -357,10 +455,21 @@ pub fn analyze(
     });
 
     if data.policy.collected_ms > 0 {
-        let verdict = verdict(s, data, &profiles, &result.rules, confirmed_block, confirmed_permit);
+        let verdict = verdict(
+            s,
+            data,
+            &profiles,
+            &result.rules,
+            confirmed_block,
+            confirmed_permit,
+        );
         result.findings.push(Finding {
             id: "policy.verdict".into(),
-            certainty: if verdict.confirmed { Certainty::Observed } else { Certainty::Inferred },
+            certainty: if verdict.confirmed {
+                Certainty::Observed
+            } else {
+                Certainty::Inferred
+            },
             title: verdict.headline.clone(),
             explanation: verdict.reason.clone(),
             evidence: vec![policy_ref.clone()],
@@ -542,6 +651,98 @@ mod tests {
         assert_eq!(v.outcome, Outcome::BlockedByDefault);
         assert_eq!(v.closest_rule.as_deref(), Some("rule-1"));
         assert_eq!(a.findings[0].id, "policy.verdict");
+    }
+    #[test]
+    fn enrich_resolves_subnets_services_token_and_dynamic_ports() {
+        let c = crate::state::connection(42, Some(1), "Listen");
+        let mut d = data();
+        d.capabilities = ["Network", "Routes", "Services"]
+            .map(|source| Capability {
+                source: source.into(),
+                status: "Available".into(),
+                detail: String::new(),
+            })
+            .to_vec();
+        d.process = Some(ProcessContext {
+            pid: 42,
+            token: Some(TokenIdentity {
+                user_sid: "S-1-5-21-1-2-3-1001".into(),
+                ..TokenIdentity::default()
+            }),
+            ..ProcessContext::default()
+        });
+        d.services = vec![
+            Service {
+                name: "Dnscache".into(),
+                pid: 42,
+                state: "Running".into(),
+                ..Service::default()
+            },
+            Service {
+                name: "Other".into(),
+                pid: 7,
+                state: "Running".into(),
+                ..Service::default()
+            },
+        ];
+        d.interfaces = vec![
+            Interface {
+                index: 5,
+                status: "Up".into(),
+                addresses: vec![
+                    "10.0.0.42/24".into(),
+                    "2601:281::1094/128".into(),
+                    "fe80::1%5/64".into(),
+                ],
+                dns: vec!["10.0.0.1".into()],
+                ..Interface::default()
+            },
+            Interface {
+                index: 9,
+                status: "Disconnected".into(),
+                addresses: vec!["192.168.9.2/24".into()],
+                ..Interface::default()
+            },
+        ];
+        d.routes = vec![
+            Route {
+                destination: "2601:281::/64".into(),
+                next_hop: "::".into(),
+                interface: 5,
+                ..Route::default()
+            },
+            Route {
+                destination: "0.0.0.0/0".into(),
+                next_hop: "10.0.0.1".into(),
+                interface: 5,
+                ..Route::default()
+            },
+            Route {
+                destination: "10.0.0.42/32".into(),
+                next_hop: "0.0.0.0".into(),
+                interface: 5,
+                ..Route::default()
+            },
+        ];
+        d.tcp_dynamic_ports = Some([49152, 16384]);
+        let e = enrich(&Scenario::for_connection(&c), &d);
+        assert_eq!(e.token.unwrap().user_sid, "S-1-5-21-1-2-3-1001");
+        assert_eq!(e.hosted_services, Some(vec!["Dnscache".to_string()]));
+        assert_eq!(e.network.dynamic_ports, Some((49152, 65535)));
+        assert!(e.network.known);
+        assert_eq!(
+            e.network.subnets,
+            vec!["10.0.0.42/24", "fe80::1/64", "2601:281::/64"]
+        );
+        assert_eq!(
+            e.network.dns,
+            vec!["10.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        // Another PID's collection lends nothing.
+        let mut other = Scenario::for_connection(&c);
+        other.pid = Some(7);
+        let e = enrich(&other, &d);
+        assert!(e.token.is_none() && e.hosted_services.is_none());
     }
     #[test]
     fn deterministic_replay() {

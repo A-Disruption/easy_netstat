@@ -99,6 +99,47 @@ pub struct Scenario {
     pub interface: Option<String>,
     pub interface_type: Option<String>,
     pub hypothetical: bool,
+    /// Owning process; identifies the kernel ("System", PID 4).
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Revalidated process token; None when it couldn't be read.
+    #[serde(default)]
+    pub token: Option<TokenIdentity>,
+    /// Running services hosted by the process; None when not collected.
+    #[serde(default)]
+    pub hosted_services: Option<Vec<String>>,
+    /// Facts that resolve address and port keywords in rules.
+    #[serde(default)]
+    pub network: NetworkContext,
+}
+
+/// Security identity of a process token, as SID strings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TokenIdentity {
+    pub user_sid: String,
+    /// Enabled groups, excluding deny-only ones.
+    pub groups: Vec<String>,
+    /// Groups that only ever match deny entries.
+    pub deny_only: Vec<String>,
+    /// AppContainer (package) SID; None for ordinary desktop processes.
+    pub app_container_sid: Option<String>,
+}
+
+/// What a rule's keywords (LocalSubnet, DNS, RPC, ...) resolve to here.
+/// `known` is false when network context wasn't collected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkContext {
+    pub known: bool,
+    /// On-link prefixes, "address/length".
+    pub subnets: Vec<String>,
+    pub dns: Vec<IpAddr>,
+    pub gateways: Vec<IpAddr>,
+    pub dhcp: Vec<IpAddr>,
+    pub wins: Vec<IpAddr>,
+    /// Inclusive dynamic (ephemeral) port range for this protocol.
+    pub dynamic_ports: Option<(u16, u16)>,
 }
 impl Scenario {
     pub fn for_connection(c: &Connection) -> Self {
@@ -113,6 +154,10 @@ impl Scenario {
             interface: None,
             interface_type: None,
             hypothetical: true,
+            pid: Some(c.key.process.pid),
+            token: None,
+            hosted_services: None,
+            network: NetworkContext::default(),
         }
     }
 }
@@ -139,14 +184,19 @@ pub struct Interface {
     pub addresses: Vec<String>,
     pub dns: Vec<String>,
     pub gateways: Vec<String>,
+    pub dhcp: Vec<String>,
+    pub wins: Vec<String>,
     pub status: String,
     pub errors: Option<u64>,
 }
 impl Interface {
     pub fn has_ip(&self, ip: IpAddr) -> bool {
-        self.addresses
-            .iter()
-            .any(|a| a.split('/').next().and_then(|a| a.parse::<IpAddr>().ok()) == Some(ip))
+        self.addresses.iter().any(|a| {
+            a.split(['/', '%'])
+                .next()
+                .and_then(|a| a.parse::<IpAddr>().ok())
+                == Some(ip)
+        })
     }
 }
 
@@ -201,6 +251,12 @@ pub struct FirewallRule {
     pub unsupported: Vec<String>,
     pub complete: bool,
     pub enforcement: String,
+    /// Owning user SID (per-user and AppContainer rules).
+    pub owner: String,
+    /// AppContainer package SID the rule is limited to.
+    pub package: String,
+    /// SDDL of local users/groups allowed by the rule.
+    pub local_user: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -232,6 +288,8 @@ pub struct ProcessContext {
     pub command_line: Option<String>,
     pub owner: Option<String>,
     pub path: Option<String>,
+    /// Read natively inside the same identity check as `created`.
+    pub token: Option<TokenIdentity>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -259,6 +317,9 @@ pub struct DiagnosticData {
     pub events: Vec<RawEvent>,
     pub capabilities: Vec<Capability>,
     pub filters: Vec<FilterEvidence>,
+    /// [start, count] of the TCP/UDP dynamic port ranges.
+    pub tcp_dynamic_ports: Option<[u32; 2]>,
+    pub udp_dynamic_ports: Option<[u32; 2]>,
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::diagnostic_style::{
-    Tone, badge, capability, certainty_tone, detail_group, diagnostic_scroll, expanding_body,
-    firewall_enabled_status, key_value, match_tone, metric, muted, notice, section,
+    Tone, ago, badge, capability, certainty_tone, detail_group, diagnostic_scroll, expanding_body,
+    firewall_enabled_status, key_value, match_tone, muted, notice, section,
 };
 use easy_netstat::model::Direction as TrafficDirection;
 use std::path::PathBuf;
@@ -74,28 +74,24 @@ impl App {
         )
     }
     pub(super) fn inventory_status(&self) -> String {
-        format!(
-            "{} | {} endpoints | last success: {} | changes: {} ({} evicted){}",
-            if self.inventory_gate.busy() {
-                "Refreshing…"
-            } else if self.auto_refresh {
-                "Automatic refresh enabled"
-            } else {
-                "Automatic refresh paused"
-            },
-            self.history.current.len(),
+        let mut parts = vec![format!("{} endpoints", self.history.current.len())];
+        parts.push(if self.inventory_gate.busy() {
+            "refreshing…".into()
+        } else {
             self.history
                 .last_success_ms
-                .map(|t| format!("{t} ms UTC"))
-                .unwrap_or_else(|| "not yet available".into()),
-            self.history.changes.len(),
-            self.history.evicted,
-            if self.history.errors.is_empty() {
-                String::new()
-            } else {
-                format!(" | PARTIAL/STALE: {}", self.history.errors.join("; "))
-            }
-        )
+                .map(|t| format!("updated {}", ago(t)))
+                .unwrap_or_else(|| "not loaded yet".into())
+        });
+        parts.push(if self.auto_refresh {
+            format!("auto-refresh every {} s", self.refresh_secs)
+        } else {
+            "auto-refresh off".into()
+        });
+        if !self.history.errors.is_empty() {
+            parts.push(format!("partial: {}", self.history.errors.join("; ")));
+        }
+        parts.join(" · ")
     }
     pub(super) fn scenario(&self) -> Result<Scenario, String> {
         let c = self.selected.as_ref().ok_or("Select a connection")?;
@@ -244,15 +240,6 @@ impl App {
                 }
                 self.status="Endpoint selected. Open Diagnostics to inspect its process, firewall policy, network context and recorded events.".into();
             }
-            Message::ToggleWorkbench => {
-                if self.show_workbench {
-                    return self.update_workbench(Message::CloseDetails);
-                }
-                self.show_workbench = true;
-                self.show_settings = false;
-                self.autocomplete_suggestions.clear();
-                self.autocomplete_selected_index = None;
-            }
             Message::DiagnosticTabChanged(tab) => {
                 self.diagnostic_tab = tab;
                 return widget::operation::scrollable::snap_to(
@@ -317,6 +304,8 @@ impl App {
             Message::OpenFullReport => {
                 self.show_workbench = true;
                 self.show_settings = false;
+                self.autocomplete_suggestions.clear();
+                self.autocomplete_selected_index = None;
             }
             Message::ShowRuleDetail(id) => self.rule_detail = id,
             Message::OpenRuleInBrowser(id) => {
@@ -667,33 +656,6 @@ impl App {
                 .unwrap_or_default(),
         }
     }
-    pub(super) fn toolbar(&self) -> Element<'_, Message> {
-        row![
-            button(if self.show_panel {
-                "Hide reachability"
-            } else {
-                "Reachability"
-            })
-            .on_press(Message::TogglePanel),
-            button("Full report")
-                .style(button::secondary)
-                .on_press(Message::ToggleWorkbench),
-            text(
-                self.selected
-                    .as_ref()
-                    .map(|c| format!(
-                        "Selected: {} · PID {} · {}",
-                        c.process.name, c.key.process.pid, c.key.local
-                    ))
-                    .unwrap_or_else(|| "Select a connection to inspect it".into())
-            )
-            .size(13),
-            space::horizontal()
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center)
-        .boxed()
-    }
     fn section_button(&self, name: &str) -> Element<'_, Message> {
         button(text(format!(
             "{} {}",
@@ -733,6 +695,12 @@ impl App {
                 DiagnosticTab::History => self.history_tab(),
                 DiagnosticTab::Tools => self.tools_tab(),
             };
+            let (privilege, privilege_tone) = match &self.elevation_status {
+                Ok(true) => ("Administrator", Tone::Success),
+                Ok(false) => ("Standard user", Tone::Info),
+                Err(_) => ("Privilege unknown", Tone::Warning),
+            };
+            let busy = self.diagnostic_gate.busy();
             expanding_body(iced::widget::column![
                 row![
                     text(
@@ -744,22 +712,15 @@ impl App {
                             ))
                             .unwrap_or_else(|| "Diagnostic tools".into())
                     )
-                    .size(16),
-                    space::horizontal(),
-                    button(if self.diagnostic_gate.busy() {
-                        "Collecting…"
-                    } else {
-                        "Collect diagnostics"
-                    })
-                    .on_press_maybe(
-                        (self.selected.is_some() && !self.diagnostic_gate.busy())
-                            .then_some(Message::Diagnose(false))
+                    .size(15)
+                    .width(Length::Fill),
+                    badge(privilege, privilege_tone),
+                    button(if busy { "Collecting…" } else { "Collect" }).on_press_maybe(
+                        (self.selected.is_some() && !busy).then_some(Message::Diagnose(false))
                     ),
-                    button("Cancel").style(button::text).on_press_maybe(
-                        self.diagnostic_gate
-                            .busy()
-                            .then_some(Message::CancelDiagnosis)
-                    )
+                    button("Cancel")
+                        .style(button::text)
+                        .on_press_maybe(busy.then_some(Message::CancelDiagnosis))
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -785,65 +746,46 @@ impl App {
             .on_dismiss(Message::CloseDetails)
             .boxed()
     }
+    /// Shown only when not elevated; the header badge already says which.
     fn privilege_controls(&self) -> Element<'_, Message> {
-        let (label, tone) = match &self.elevation_status {
-            Ok(true) => ("Administrator", Tone::Success),
-            Ok(false) => ("Standard user", Tone::Info),
-            Err(_) => ("Privilege status unavailable", Tone::Warning),
-        };
-        let mut controls = iced::widget::column![
-            row![
-                badge(label, tone),
-                space::horizontal(),
-                button(if self.elevation_busy {
-                    "Waiting for UAC…"
-                } else {
-                    "Restart as administrator"
-                })
-                .on_press_maybe(
-                    (!self.elevation_busy && !matches!(self.elevation_status, Ok(true)))
-                        .then_some(Message::RestartAsAdministrator)
-                )
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-        ]
-        .spacing(4);
-        if !matches!(self.elevation_status, Ok(true)) {
-            controls = controls.push(text("Restart requests Windows approval and clears unsaved session history/diagnostics. Saved files are kept on disk.").size(12).style(muted).boxed());
+        if matches!(self.elevation_status, Ok(true)) {
+            return space::horizontal().height(0).boxed();
         }
-        controls.boxed()
+        row![
+            text("Security events need administrator rights. Restarting asks Windows for approval and clears unsaved session history.")
+                .size(12)
+                .style(muted)
+                .width(Length::Fill),
+            button(if self.elevation_busy {
+                "Waiting for UAC…"
+            } else {
+                "Restart as administrator"
+            })
+            .style(button::secondary)
+            .on_press_maybe((!self.elevation_busy).then_some(Message::RestartAsAdministrator))
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .boxed()
     }
 
     fn no_collection(&self) -> Element<'_, Message> {
         let message = if self.selected.is_none() {
             "Select a connection in the table, then open Diagnostics. Saved views, snapshots, reports and DNS lookup are in Tools / reports."
         } else {
-            "Click Collect diagnostics to load effective firewall rules, process/services, network configuration and existing Windows events. No settings are changed."
+            "Click Collect to load effective firewall rules, process/services, network configuration and existing Windows events. No settings are changed."
         };
         notice("Getting started", message, Tone::Info)
     }
     fn overview_tab(&self) -> Element<'_, Message> {
-        let failures = self
-            .analysis
-            .findings
-            .iter()
-            .filter(|f| f.certainty == diagnostics::Certainty::ConfirmedFailure)
-            .count();
-        let inferred = self
-            .analysis
-            .findings
-            .iter()
-            .filter(|f| f.certainty == diagnostics::Certainty::Inferred)
-            .count();
-        let observed = self
-            .analysis
-            .findings
-            .iter()
-            .filter(|f| f.certainty == diagnostics::Certainty::Observed)
-            .count();
-        let mut content=iced::widget::column![section("Diagnostic summary","Evidence class and configuration state are separate. Color is always accompanied by a label."),
-            row![metric("Confirmed failures",failures,if failures>0{Tone::Danger}else{Tone::Neutral}),metric("Inferred findings",inferred,if inferred>0{Tone::Warning}else{Tone::Neutral}),metric("Observed facts",observed,Tone::Info)].spacing(12)].spacing(16);
+        let mut content = iced::widget::column![section(
+            "Verdict",
+            "What Windows Firewall would most likely do with the examined traffic."
+        )]
+        .spacing(16);
+        if let Some(v) = &self.analysis.verdict {
+            content = content.push(self.verdict_view(v));
+        }
         if let Some(data) = &self.diagnostic_data {
             let missing: Vec<_> = data
                 .capabilities
@@ -867,7 +809,13 @@ impl App {
         } else {
             6
         };
-        for finding in self.analysis.findings.iter().take(shown) {
+        for finding in self
+            .analysis
+            .findings
+            .iter()
+            .filter(|f| f.id != "policy.verdict")
+            .take(shown)
+        {
             content = content.push(self.finding_card(finding));
         }
         if self.analysis.findings.len() > 6 {
@@ -1011,11 +959,11 @@ impl App {
         if self.sections.contains("Evidence references") {
             card = card.push(
                 text(format!(
-                    "Evidence: {}\nAssumptions: {}\nEvaluator {} · {} ms UTC",
+                    "Evidence: {}\nAssumptions: {}\nEvaluator {} · collected {}",
                     f.evidence.join(", "),
                     f.assumptions.join("; "),
                     self.analysis.evaluator_version,
-                    f.time_ms
+                    ago(f.time_ms)
                 ))
                 .size(12)
                 .boxed(),
@@ -1114,11 +1062,8 @@ impl App {
                         .unwrap_or_else(|| "unspecified peer".into())
                 ),
             ));
-            if scenario.local.ip().is_unspecified()
-                || scenario.remote.is_none()
-                || scenario.profile.is_none()
-            {
-                content = content.push(notice("Scenario needs context", "Set the concrete local IP, peer and interface in Overview. Unknown inputs stay unknown; an incomplete candidate does not establish whether this traffic is permitted.", Tone::Warning));
+            if scenario.remote.is_none() {
+                content = content.push(notice("Peer not set", "Without a peer address, rules limited to certain remote addresses or ports can't be decided. Enter one in the reachability panel or Overview.", Tone::Warning));
             }
         }
         for cap in data
@@ -1433,7 +1378,14 @@ impl App {
                             .clone()
                             .unwrap_or_else(|| "Unavailable".into()),
                     ),
-                    ("Creation identity", format!("{:?}", c.key.process.created)),
+                    (
+                        "Started",
+                        c.key
+                            .process
+                            .created
+                            .map(|t| ago(easy_netstat::inventory::filetime_ms(t)))
+                            .unwrap_or_default(),
+                    ),
                 ],
             ));
             if !c.process.unavailable.is_empty() {
@@ -1550,7 +1502,11 @@ impl App {
                                     Tone::Warning
                                 }
                             ),
-                            badge(format!("{} profile", i.profile), Tone::Info)
+                            if i.profile.is_empty() {
+                                text("").boxed()
+                            } else {
+                                badge(format!("{} profile", i.profile), Tone::Info)
+                            }
                         ]
                         .spacing(8),
                         key_value("Type", i.kind.clone()),
@@ -1559,7 +1515,10 @@ impl App {
                         key_value("Gateways", values(&i.gateways)),
                         key_value(
                             "Error counter",
-                            format!("{:?} (absolute, not a rate)", i.errors)
+                            match i.errors {
+                                Some(n) => format!("{n} since the adapter started"),
+                                None => "Not reported".into(),
+                            }
                         )
                     ]
                     .spacing(10),
@@ -1617,7 +1576,7 @@ impl App {
             .take(50)
         {
             count += 1;
-            content=content.push(container(iced::widget::column![row![text(format!("Event {}",event.event_id)).size(16).font(Font{weight:font::Weight::Bold,..Font::DEFAULT}),space::horizontal(),badge("PID-only context",Tone::Info)].spacing(8),key_value("Time",format!("{} ms UTC",event.time_ms)),key_value("Traffic",format!("{} → {}",event.source.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()),event.destination.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()))),key_value("Direction / protocol",format!("{:?} / {:?}",event.direction,event.protocol)),key_value("Filter / layer",format!("{:?} / {}",event.filter_id,event.layer)),text("Confirmed attribution requires the full traffic tuple and process lifetime.").size(12).style(muted)].spacing(10)).padding(14).width(Length::Fill).style(|t:&Theme|Tone::Neutral.surface(t)).boxed());
+            content=content.push(container(iced::widget::column![row![text(format!("Event {}",event.event_id)).size(16).font(Font{weight:font::Weight::Bold,..Font::DEFAULT}),space::horizontal(),badge("PID-only context",Tone::Info)].spacing(8),key_value("Time",ago(event.time_ms)),key_value("Traffic",format!("{} → {}",event.source.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()),event.destination.map(|a|a.to_string()).unwrap_or_else(||"Unknown".into()))),key_value("Direction / protocol",format!("{} / {}",event.direction.map(|d|d.to_string()).unwrap_or_else(||"Unknown".into()),event.protocol.map(|p|p.to_string()).unwrap_or_else(||"Unknown".into()))),key_value("Filter / layer",format!("{} / {}",event.filter_id.map(|f|f.to_string()).unwrap_or_else(||"Unknown".into()),event.layer)),text("Confirmed attribution requires the full traffic tuple and process lifetime.").size(12).style(muted)].spacing(10)).padding(14).width(Length::Fill).style(|t:&Theme|Tone::Neutral.surface(t)).boxed());
         }
         if count == 0 {
             content=content.push(text("No recorded WFP events for this PID in the collected window. This does not prove traffic was allowed.").boxed());
@@ -1662,8 +1621,11 @@ impl App {
             {
                 content = content.push(
                     text(format!(
-                        "{} ms UTC · {}\n{} → {}",
-                        change.time_ms, change.kind, change.before, change.after
+                        "{} · {}\n{} → {}",
+                        ago(change.time_ms),
+                        change.kind,
+                        change.before,
+                        change.after
                     ))
                     .size(13)
                     .boxed(),
@@ -1897,11 +1859,19 @@ mod tests {
         );
         // Accepted connection on a port the same process listens on.
         assert_eq!(
-            app.guess_direction(&conn("10.20.0.10:5001", Some("10.30.0.25:53000"), "Established")),
+            app.guess_direction(&conn(
+                "10.20.0.10:5001",
+                Some("10.30.0.25:53000"),
+                "Established"
+            )),
             TrafficDirection::Inbound
         );
         assert_eq!(
-            app.guess_direction(&conn("10.20.0.10:49702", Some("10.20.0.5:1433"), "Established")),
+            app.guess_direction(&conn(
+                "10.20.0.10:49702",
+                Some("10.20.0.5:1433"),
+                "Established"
+            )),
             TrafficDirection::Outbound
         );
         let outbound = conn("10.20.0.10:49702", Some("10.20.0.5:1433"), "Established");
@@ -1910,18 +1880,27 @@ mod tests {
         assert!(app.direction_confirmed && app.direction_guessed);
         assert_eq!(app.direction, TrafficDirection::Outbound);
         assert_eq!(app.peer_input, "10.20.0.5:1433");
-        let _ = app.update(Message::ScenarioChanged("direction".into(), "Inbound".into()));
+        let _ = app.update(Message::ScenarioChanged(
+            "direction".into(),
+            "Inbound".into(),
+        ));
         assert!(!app.direction_guessed);
     }
     #[test]
     fn inputs_change_re_evaluates_cached_evidence() {
         let mut app = fixture();
-        let _ = app.update(Message::ScenarioChanged("peer".into(), "10.30.0.25:53000".into()));
+        let _ = app.update(Message::ScenarioChanged(
+            "peer".into(),
+            "10.30.0.25:53000".into(),
+        ));
         assert!(app.analysis_busy, "cached data should be re-evaluated");
         // A result for the superseded request is dropped and evaluation re-runs.
         let request = app.analysis_request;
         let key = app.selected.as_ref().unwrap().key.clone();
-        let _ = app.update(Message::ScenarioChanged("peer".into(), "10.30.0.26:53000".into()));
+        let _ = app.update(Message::ScenarioChanged(
+            "peer".into(),
+            "10.30.0.26:53000".into(),
+        ));
         let _ = app.update(Message::AnalysisReady(
             request,
             key,
@@ -1984,13 +1963,13 @@ mod tests {
     fn popup_and_settings_are_exclusive_and_dismissible() {
         let mut app = fixture();
         app.show_settings = true;
-        let _ = app.update(Message::ToggleWorkbench);
+        let _ = app.update(Message::OpenFullReport);
         assert!(app.show_workbench);
         assert!(!app.show_settings);
         let _ = app.update(Message::Settings);
         assert!(app.show_settings);
         assert!(!app.show_workbench);
-        let _ = app.update(Message::ToggleWorkbench);
+        let _ = app.update(Message::OpenFullReport);
         let cancel = Arc::new(AtomicBool::new(false));
         app.diagnostic_cancel = Some(cancel.clone());
         let _ = app.update(Message::CloseDetails);

@@ -231,7 +231,10 @@ mod tests {
         let mut s = crate::firewall::scenario();
         s.remote = None;
         s.local = "0.0.0.0:5001".parse().unwrap();
-        assert_eq!(scenario_peer(&e, &s), Some("10.20.0.25:53000".parse().unwrap()));
+        assert_eq!(
+            scenario_peer(&e, &s),
+            Some("10.20.0.25:53000".parse().unwrap())
+        );
         s.local = "[::]:5001".parse().unwrap();
         assert!(matches_scenario(&e, &s));
         s.local = "[::1]:5001".parse().unwrap();
@@ -243,8 +246,14 @@ mod tests {
         let mut raw = event();
         raw.xml = raw
             .xml
-            .replace("10.20.0.25</Data><Data Name=\"SourcePort\">53000", "10.20.0.10</Data><Data Name=\"SourcePort\">5001")
-            .replace("10.20.0.10</Data><Data Name=\"DestPort\">5001", "10.20.0.25</Data><Data Name=\"DestPort\">53000");
+            .replace(
+                "10.20.0.25</Data><Data Name=\"SourcePort\">53000",
+                "10.20.0.10</Data><Data Name=\"SourcePort\">5001",
+            )
+            .replace(
+                "10.20.0.10</Data><Data Name=\"DestPort\">5001",
+                "10.20.0.25</Data><Data Name=\"DestPort\">53000",
+            );
         let e = network_event(&raw).unwrap();
         assert_eq!(e.source, Some("10.20.0.10:5001".parse().unwrap()));
         let s = crate::firewall::scenario();

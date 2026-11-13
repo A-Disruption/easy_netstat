@@ -242,12 +242,33 @@ impl DiagnosticCollector {
                 .collect();
         }
         // Never attach a reused PID's command line/account/service membership.
+        // Read between the two identity samples so a reused PID can't lend
+        // another process's user, groups or package to this one.
+        let token = crate::inventory::process_token(selected.key.process.pid);
         let after = crate::inventory::process_identity(selected.key.process.pid);
         let identity_matches = data.process.as_ref().is_some_and(|p| {
             enrichment_identity_matches(&selected.key.process, &before, &after, p)
         });
         if identity_matches && let Some(p) = &mut data.process {
             p.created = selected.key.process.created;
+            match token {
+                Ok(t) => {
+                    p.token = Some(t);
+                    data.capabilities.push(Capability {
+                        source: "Process token".into(),
+                        status: "Available".into(),
+                        detail: "User, group and package identity read from the process token."
+                            .into(),
+                    });
+                }
+                Err(e) => data.capabilities.push(Capability {
+                    source: "Process token".into(),
+                    status: "Unavailable".into(),
+                    detail: format!(
+                        "{e}. Rules limited to an owner, package or local user stay undecided."
+                    ),
+                }),
+            }
         }
         if !identity_matches {
             data.process = None;

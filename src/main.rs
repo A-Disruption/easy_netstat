@@ -95,7 +95,6 @@ enum Message {
     RefreshData,
     InventoryReady(u64, Result<Arc<Inventory>, String>),
     SelectConnection(Option<ConnectionKey>),
-    ToggleWorkbench,
     DiagnosticTabChanged(workbench_ui::DiagnosticTab),
     RuleSearchChanged(String),
     RulePageChanged(usize),
@@ -442,7 +441,6 @@ impl App {
             other @ (Message::RestartAsAdministrator
             | Message::AdministratorRestartReady(_)
             | Message::SelectConnection(_)
-            | Message::ToggleWorkbench
             | Message::DiagnosticTabChanged(_)
             | Message::RuleSearchChanged(_)
             | Message::RulePageChanged(_)
@@ -595,25 +593,28 @@ impl App {
                     })
                 };
 
+                // Column order follows the question people ask: which program,
+                // then where it talks, then what the firewall makes of it.
+                let mono = |value: &'a str| text(value).font(Font::MONOSPACE).size(13);
                 data_table(vec![
-                    leaf(bold("Protocol")).fixed(90.0).sortable(),
-                    leaf(bold("State")).fixed(130.0).sortable(),
-                    leaf(bold("Local Address")).fill(2).sortable(),
-                    leaf(bold("Remote Address")).fill(2).sortable(),
+                    leaf(bold("Process")).fill(2).sortable(),
                     leaf(bold("PID"))
                         .fixed(80.0)
                         .align(alignment::Horizontal::Right)
                         .sortable(),
-                    leaf(bold("Process")).fill(2).sortable(),
+                    leaf(bold("Proto")).fixed(70.0).sortable(),
+                    leaf(bold("Local")).fill(3).sortable(),
+                    leaf(bold("Remote")).fill(3).sortable(),
+                    leaf(bold("State")).fixed(120.0).sortable(),
                     leaf(bold("Reach")).fixed(130.0),
                 ])
-                .rows(rows, |socket, column| match column {
-                    0 => text(&socket.protocol).boxed(),
-                    1 => text(&socket.state).boxed(),
-                    2 => text(&socket.local_addr).boxed(),
-                    3 => text(&socket.remote_addr).boxed(),
-                    4 => text(&socket.pid).boxed(),
-                    5 => text(&socket.process_name).boxed(),
+                .rows(rows, move |socket, column| match column {
+                    0 => text(&socket.process_name).boxed(),
+                    1 => mono(&socket.pid).boxed(),
+                    2 => text(&socket.protocol).boxed(),
+                    3 => mono(&socket.local_addr).boxed(),
+                    4 => mono(&socket.remote_addr).boxed(),
+                    5 => text(&socket.state).boxed(),
                     _ => self.reach_cell(socket.key.as_ref()),
                 })
                 .selection(
@@ -683,15 +684,22 @@ impl App {
                     .style(blank_popover),
                     button(icon::refresh())
                         .on_press(Message::RefreshData)
-                        .style(button::text)
+                        .style(button::text),
+                    button(if self.show_panel {
+                        "Hide reachability"
+                    } else {
+                        "Reachability"
+                    })
+                    .style(button::secondary)
+                    .on_press(Message::TogglePanel)
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center)
                 .padding(10.0),
-                self.toolbar(),
-                text(self.inventory_status()).size(12),
-                text(&self.status).size(12),
-                text(self.filter_error.as_deref().unwrap_or("")).size(12),
+                match &self.filter_error {
+                    Some(error) => text(error).size(12).style(text::danger).boxed(),
+                    None => space::horizontal().height(0).boxed(),
+                },
                 if self.show_panel {
                     row![
                         container(process).width(Length::Fill).height(Length::Fill),
@@ -704,7 +712,10 @@ impl App {
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .boxed()
-                }
+                },
+                text(self.inventory_status())
+                    .size(12)
+                    .style(diagnostic_style::muted),
             ]
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1006,21 +1017,21 @@ fn blank_popover(theme: &Theme) -> popover::Style {
 fn sort_rows(rows: &mut [&SocketDisplay], sort: Sort) {
     rows.sort_by(|a, b| {
         let ordering = match sort.column {
-            0 => a.protocol.cmp(&b.protocol),
-            1 => a.state.cmp(&b.state),
-            2 => a
+            2 => a.protocol.cmp(&b.protocol),
+            5 => a.state.cmp(&b.state),
+            3 => a
                 .local_addr
                 .parse::<std::net::SocketAddr>()
                 .ok()
                 .cmp(&b.local_addr.parse::<std::net::SocketAddr>().ok()),
-            3 => a
+            4 => a
                 .remote_addr
                 .parse::<std::net::SocketAddr>()
                 .ok()
                 .cmp(&b.remote_addr.parse::<std::net::SocketAddr>().ok()),
             // Numerically, so 9 comes before 10. Sockets with no owning process
             // carry "-" rather than a number, and sort to the end ascending.
-            4 => a
+            1 => a
                 .pid
                 .parse::<u32>()
                 .unwrap_or(u32::MAX)
@@ -1109,7 +1120,7 @@ mod tests {
         let a = socket("127.0.0.1:9", "a", "9");
         let b = socket("127.0.0.1:10", "B", "10");
         let mut rows = vec![&b, &a];
-        for column in [2, 4] {
+        for column in [3, 1] {
             sort_rows(
                 &mut rows,
                 Sort {
