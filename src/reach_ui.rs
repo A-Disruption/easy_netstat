@@ -601,6 +601,9 @@ impl App {
             })
             .size(13)
             .font(Font::MONOSPACE)
+            // SIDs, paths and IPv6 addresses have no spaces; break inside them
+            // rather than running over the next column.
+            .wrapping(text::Wrapping::WordOrGlyph)
             .width(Length::FillPortion(2))
         };
         let mut table = iced::widget::column![
@@ -622,7 +625,10 @@ impl App {
         .spacing(2);
         for c in &e.conditions {
             let line = row![
-                text(c.name.clone()).size(13).width(130),
+                text(c.name.clone())
+                    .size(13)
+                    .width(130)
+                    .wrapping(text::Wrapping::WordOrGlyph),
                 cell(if c.rule_value.is_empty() && c.traffic.is_empty() {
                     &c.detail
                 } else {
@@ -767,8 +773,8 @@ impl App {
         };
         modal(content, "Rule vs traffic")
             .open(self.rule_detail.is_some())
-            .min_width(820.0)
-            .max_width(1100.0)
+            .min_width(1120.0)
+            .max_width(1500.0)
             .min_height(420.0)
             .on_dismiss(Message::ShowRuleDetail(None))
             .boxed()

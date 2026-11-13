@@ -1,4 +1,6 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// No console window in any normal build. Tests keep one so the harness can
+// report; nothing in the app writes to stdout or stderr.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 use iced::event;
 use iced::keyboard;
@@ -595,6 +597,19 @@ impl App {
 
                 // Column order follows the question people ask: which program,
                 // then where it talks, then what the firewall makes of it.
+                // One line per cell, shortened with an ellipsis and clipped, so a
+                // narrowed column never spills into its neighbor. Addresses are cut
+                // in the middle to keep both the prefix and the port visible.
+                //
+                // Widths stay Shrink: the table first measures cells with unbounded
+                // width to find each column's natural size, so Fill would claim
+                // infinite space. The final pass bounds each cell to its column,
+                // which is what triggers the ellipsis and the clip.
+                let cell = |content: iced::widget::Text<'a, Theme>, cut: text::Ellipsis| {
+                    container(content.wrapping(text::Wrapping::None).ellipsis(cut))
+                        .clip(true)
+                        .boxed()
+                };
                 let mono = |value: &'a str| text(value).font(Font::MONOSPACE).size(13);
                 data_table(vec![
                     leaf(bold("Process")).fill(2).sortable(),
@@ -609,13 +624,18 @@ impl App {
                     leaf(bold("Reach")).fixed(130.0),
                 ])
                 .rows(rows, move |socket, column| match column {
-                    0 => text(&socket.process_name).boxed(),
-                    1 => mono(&socket.pid).boxed(),
-                    2 => text(&socket.protocol).boxed(),
-                    3 => mono(&socket.local_addr).boxed(),
-                    4 => mono(&socket.remote_addr).boxed(),
-                    5 => text(&socket.state).boxed(),
-                    _ => self.reach_cell(socket.key.as_ref()),
+                    0 => cell(text(&socket.process_name), text::Ellipsis::End),
+                    1 => cell(
+                        mono(&socket.pid).align_x(alignment::Horizontal::Right),
+                        text::Ellipsis::Start,
+                    ),
+                    2 => cell(text(&socket.protocol), text::Ellipsis::End),
+                    3 => cell(mono(&socket.local_addr), text::Ellipsis::Middle),
+                    4 => cell(mono(&socket.remote_addr), text::Ellipsis::Middle),
+                    5 => cell(text(&socket.state), text::Ellipsis::End),
+                    _ => container(self.reach_cell(socket.key.as_ref()))
+                        .clip(true)
+                        .boxed(),
                 })
                 .selection(
                     advanced_table::SelectionMode::Single,
